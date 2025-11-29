@@ -448,14 +448,18 @@ export async function registerRoutes(
       // Set cookie
       const cookieName = `chat_${req.params.slug}`;
       const cookieValue = Buffer.from(JSON.stringify({ name: req.body.name })).toString("base64");
-      
+
       res.cookie(cookieName, cookieValue, {
         httpOnly: true,
         secure: true,
         maxAge: 7 * 24 * 60 * 60 * 1000, // 1 week
       });
 
-      res.json({ success: true });
+      res.json({
+        success: true,
+        contactEmail: issue.contactEmail,
+        issueId: issue.id
+      });
     } catch (error) {
       console.error("Error verifying passcode:", error);
       res.status(500).json({ message: "Failed to verify" });

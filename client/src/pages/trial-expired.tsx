@@ -41,6 +41,7 @@ export default function TrialExpired() {
           </p>
           <div className="space-y-2">
             <Button
+              variant="honeycomb"
               className="w-full"
               size="lg"
               onClick={handleUpgrade}

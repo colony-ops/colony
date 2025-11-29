@@ -67,20 +67,12 @@ export function AppSidebar() {
     <Sidebar>
       <SidebarHeader className="p-4">
         <Link href="/" className="flex items-center gap-3">
-          {workspace?.logoUrl ? (
-            <img
-              src={workspace.logoUrl}
-              alt={workspace.name || "Workspace"}
-              className="h-9 w-9 object-contain flex-shrink-0"
-            />
-          ) : (
-            <div className="text-xl font-bold bg-gradient-to-br from-orange-500 to-orange-600 text-white rounded-lg px-2 py-1 flex-shrink-0">
-              C
-            </div>
-          )}
-          {workspace?.name && (
-            <span className="text-sm font-semibold truncate">{workspace.name}</span>
-          )}
+          <img
+            src="/favicon.png"
+            alt="Crannies CRM"
+            className="h-9 w-9 object-contain flex-shrink-0"
+          />
+          <span className="text-sm font-semibold truncate">Crannies CRM</span>
         </Link>
       </SidebarHeader>
 

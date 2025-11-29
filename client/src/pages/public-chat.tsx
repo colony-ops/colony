@@ -37,7 +37,7 @@ function PasscodeForm({
   onSuccess,
 }: {
   slug: string;
-  onSuccess: (name: string) => void;
+  onSuccess: (name: string, contactEmail?: string, issueId?: string) => void;
 }) {
   const [passcode, setPasscode] = useState("");
   const [name, setName] = useState("");
@@ -59,23 +59,21 @@ function PasscodeForm({
         name,
       });
     },
-    onSuccess: () => {
+    onSuccess: (data: { success: boolean; contactEmail?: string; issueId?: string }) => {
       // Identify user and track successful chat access
-      if (window.analytics) {
-        if (email) {
-          window.analytics.identify(email, {
-            name: name,
-            email: email,
-            chat_slug: slug,
-          });
-        }
+      if (window.analytics && data.contactEmail) {
+        window.analytics.identify(data.contactEmail, {
+          name: name,
+          email: data.contactEmail,
+          chat_slug: slug,
+        });
         window.analytics.track('chat_joined', {
           chat_slug: slug,
           client_name: name,
-          client_email: email,
+          client_email: data.contactEmail,
         });
       }
-      onSuccess(name);
+      onSuccess(name, data.contactEmail, data.issueId);
     },
     onError: (error: Error) => {
       toast({
@@ -218,9 +216,13 @@ function ChatMessage({
 function ChatRoom({
   slug,
   clientName,
+  contactEmail,
+  issueId,
 }: {
   slug: string;
   clientName: string;
+  contactEmail?: string;
+  issueId?: string;
 }) {
   const [message, setMessage] = useState("");
   const [clientLogoUrl, setClientLogoUrl] = useState<string | undefined>();
@@ -284,17 +286,16 @@ function ChatRoom({
   }, [data?.comments]);
 
   useEffect(() => {
-    // Identify user with contact email when chat loads
-    if (data?.issue?.contactEmail && window.analytics) {
-      window.analytics.identify(data.issue.contactEmail, {
+    // Identify user with contact email when chat loads (fallback if not done during verification)
+    if (contactEmail && window.analytics) {
+      window.analytics.identify(contactEmail, {
         name: clientName,
-        email: data.issue.contactEmail,
+        email: contactEmail,
         chat_slug: slug,
-        issue_id: data.issue.id,
-        contact_company: data.issue.contactCompany,
+        issue_id: issueId,
       });
     }
-  }, [data?.issue, clientName, slug]);
+  }, [contactEmail, clientName, slug, issueId]);
 
   if (isLoading) {
     return (
@@ -467,6 +468,8 @@ export default function PublicChat() {
   const { slug } = useParams<{ slug: string }>();
   const [authenticated, setAuthenticated] = useState(false);
   const [clientName, setClientName] = useState("");
+  const [contactEmail, setContactEmail] = useState<string | undefined>();
+  const [issueId, setIssueId] = useState<string | undefined>();
 
   // Check if already authenticated via cookie
   const { data: authCheck, isLoading } = useQuery<{ authenticated: boolean; clientName?: string }>({
@@ -493,13 +496,15 @@ export default function PublicChat() {
     return (
       <PasscodeForm
         slug={slug || ""}
-        onSuccess={(name) => {
+        onSuccess={(name, email, id) => {
           setClientName(name);
+          setContactEmail(email);
+          setIssueId(id);
           setAuthenticated(true);
         }}
       />
     );
   }
 
-  return <ChatRoom slug={slug || ""} clientName={clientName} />;
+  return <ChatRoom slug={slug || ""} clientName={clientName} contactEmail={contactEmail} issueId={issueId} />;
 }
