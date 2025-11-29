@@ -131,13 +131,13 @@ Key tables:
 
 ```bash
 # Start development server
-npm run dev
+bun run dev
 
 # Push database schema changes
-npm run db:push
+bun run db:push
 
 # Build for production
-npm run build
+bun run build
 ```
 
 ## Environment Variables
