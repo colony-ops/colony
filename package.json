@@ -12,7 +12,7 @@
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
     "db:push": "drizzle-kit push",
-    "postinstall": "npm run build"
+    "postinstall": "bun run build"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
