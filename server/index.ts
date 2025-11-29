@@ -1,8 +1,6 @@
 import express, { type Request, Response, NextFunction } from "express";
 import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
-import { reportUsageForAllSubscriptions } from "./usage";
-import cron from "node-cron";
 import { serveStatic } from "./static";
 import { createServer } from "http";
 
@@ -88,30 +86,37 @@ app.use((req, res, next) => {
     await setupVite(httpServer, app);
   }
 
-  // Only start the server if not running on Vercel
-  if (process.env.VERCEL !== '1') {
-    // ALWAYS serve the app on the port specified in the environment variable PORT
-    // Other ports are firewalled. Default to 5000 if not specified.
-    // this serves both the API and the client.
-    // It is the only port that is not firewalled.
-    const port = parseInt(process.env.PORT || "3000", 10);
-    httpServer.listen(
-      {
-        port,
-        host: "0.0.0.0",
-        reusePort: true,
-      },
-      () => {
-        log(`serving on port ${port}`);
+  // Initialize routes and static serving
+  (async () => {
+    await registerRoutes(httpServer, app);
 
-        // Schedule bi-monthly usage reporting (1st and 15th of every month at 2 AM)
-        cron.schedule('0 2 1,15 * *', async () => {
-          log('Running scheduled bi-monthly usage reporting');
-          await reportUsageForAllSubscriptions();
-        });
+    app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+      const status = err.status || err.statusCode || 500;
+      const message = err.message || "Internal Server Error";
 
-        log('Bi-monthly usage reporting scheduled (1st and 15th of every month at 2 AM)');
-      },
-    );
-  }
+      res.status(status).json({ message });
+    });
+
+    // Static files are served by Vercel directly
+
+    // Only start the server if not running on Vercel
+    if (process.env.VERCEL !== '1') {
+      // ALWAYS serve the app on the port specified in the environment variable PORT
+      // Other ports are firewalled. Default to 5000 if not specified.
+      // this serves both the API and the client.
+      // It is the only port that is not firewalled.
+      const port = parseInt(process.env.PORT || "3000", 10);
+      httpServer.listen(
+        {
+          port,
+          host: "0.0.0.0",
+          reusePort: true,
+        },
+        () => {
+          log(`serving on port ${port}`);
+          log('Server started successfully');
+        },
+      );
+    }
+  })();
 })();
