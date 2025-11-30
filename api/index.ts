@@ -166,6 +166,32 @@ export async function handler(event: any, context: any) {
       };
     }
 
+    if (path === '/api/auth/user') {
+      const sessionToken = cookies.stytch_session;
+      
+      if (!sessionToken) {
+        return createResponse(401, { message: 'Unauthorized' }, corsHeaders);
+      }
+
+      try {
+        const response = await stytch.sessions.authenticate({
+          session_token: sessionToken,
+        });
+
+        // Get user from database
+        const user = await storage.getUser(response.session.user_id);
+        
+        if (!user) {
+          return createResponse(401, { message: 'Unauthorized' }, corsHeaders);
+        }
+
+        return createResponse(200, user, corsHeaders);
+      } catch (error) {
+        console.error('Session validation error:', error);
+        return createResponse(401, { message: 'Unauthorized' }, corsHeaders);
+      }
+    }
+
     // If we get here, no route matched
     return createResponse(404, { message: "Not found" }, corsHeaders);
 
