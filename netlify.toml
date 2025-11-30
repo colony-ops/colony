@@ -6,8 +6,18 @@
   directory = "api"
 
 [[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/:splat"
+  from = "/api/login"
+  to = "/.netlify/functions/index"
+  status = 200
+
+[[redirects]]
+  from = "/api/authenticate"
+  to = "/.netlify/functions/index"
+  status = 200
+
+[[redirects]]
+  from = "/api/logout"
+  to = "/.netlify/functions/index"
   status = 200
 
 [[redirects]]
