@@ -198,33 +198,15 @@ export async function handler(event: any, context: any) {
         console.log('Netlify Auth - Setting cookie:', setCookieHeader);
         console.log('Netlify Auth - Redirecting to: /');
 
-        // For SPAs, return HTML that handles the redirect client-side
+        // Force direct redirect that bypasses React issues
         return {
-          statusCode: 200,
+          statusCode: 302,
           headers: {
             ...corsHeaders,
-            'Content-Type': 'text/html',
+            'Location': '/?auth=success',
             'Set-Cookie': setCookieHeader,
           },
-          body: `
-            <!DOCTYPE html>
-            <html>
-            <head>
-              <title>Authentication Successful</title>
-              <meta http-equiv="refresh" content="0; url=/">
-              <script>
-                // Backup JavaScript redirect
-                setTimeout(function() {
-                  window.location.href = '/';
-                }, 100);
-              </script>
-            </head>
-            <body>
-              <p>Authentication successful! Redirecting to dashboard...</p>
-              <p><a href="/">Click here if not redirected automatically</a></p>
-            </body>
-            </html>
-          `,
+          body: '',
         };
       } catch (error: any) {
         console.error('Authentication error:', error);
