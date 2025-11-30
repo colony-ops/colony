@@ -211,15 +211,17 @@ export async function handler(event: any, context: any) {
             <html>
             <head>
               <title>Authentication Successful</title>
+              <meta http-equiv="refresh" content="0; url=/">
               <script>
-                // Redirect to dashboard after a short delay
+                // Backup JavaScript redirect
                 setTimeout(function() {
                   window.location.href = '/';
                 }, 100);
               </script>
             </head>
             <body>
-              <p>Authentication successful! Redirecting...</p>
+              <p>Authentication successful! Redirecting to dashboard...</p>
+              <p><a href="/">Click here if not redirected automatically</a></p>
             </body>
             </html>
           `,
@@ -309,7 +311,11 @@ export async function handler(event: any, context: any) {
     if (path === '/api/auth/user') {
       const sessionToken = cookies.stytch_session;
       
+      console.log('Netlify Auth User - Received cookies:', Object.keys(cookies));
+      console.log('Netlify Auth User - Session token present:', !!sessionToken);
+      
       if (!sessionToken) {
+        console.log('Netlify Auth User - No session token found');
         return createResponse(401, { message: 'Unauthorized' }, corsHeaders);
       }
 
