@@ -139,8 +139,17 @@ export async function handler(event: any, context: any) {
     }
 
     if (path === '/api/authenticate' && method === 'GET') {
-      const token = event.queryStringParameters?.token;
+      // Enhanced token extraction - handle multiple token parameter names
+      let token = event.queryStringParameters?.token;
       if (!token) {
+        token = event.queryStringParameters?.stytch_token || event.queryStringParameters?.public_token;
+      }
+
+      console.log('Netlify Auth - Query params:', event.queryStringParameters);
+      console.log('Netlify Auth - Extracted token:', token);
+
+      if (!token) {
+        console.error('Netlify Auth - No token found:', event.queryStringParameters);
         return {
           statusCode: 400,
           headers: { ...corsHeaders, 'Content-Type': 'text/html' },
@@ -148,7 +157,7 @@ export async function handler(event: any, context: any) {
             <html>
               <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
                 <h1>Invalid Magic Link</h1>
-                <p>The magic link is invalid or has expired.</p>
+                <p>The magic link is missing or invalid.</p>
                 <p><a href="/login" style="color: #007bff; text-decoration: none;">← Back to Login</a></p>
               </body>
             </html>
@@ -157,9 +166,17 @@ export async function handler(event: any, context: any) {
       }
 
       try {
+        console.log('Netlify Auth - Attempting to authenticate token:', token);
+        
         const response = await stytch.magicLinks.authenticate({
           token,
           session_duration_minutes: 60 * 24 * 7, // 1 week
+        });
+
+        console.log('Netlify Auth - Authentication successful:', {
+          user_id: response.user.user_id,
+          email: response.user.emails[0]?.email,
+          session_token: response.session_token ? "present" : "missing"
         });
 
         // Upsert user in our database
@@ -190,7 +207,8 @@ export async function handler(event: any, context: any) {
         // Handle specific Stytch errors
         if (error.error_type === "invalid_authentication" || 
             error.error_message?.includes("expired") ||
-            error.error_message?.includes("already been used")) {
+            error.error_message?.includes("already been used") ||
+            error.error_type === "unable_to_auth_magic_link") {
           return {
             statusCode: 410,
             headers: { ...corsHeaders, 'Content-Type': 'text/html' },
