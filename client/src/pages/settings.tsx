@@ -500,6 +500,7 @@ export default function Settings() {
           </CardContent>
         </Card>
 
+        {/*
         <Card>
           <CardHeader>
             <div className="flex items-center gap-3">
@@ -657,6 +658,7 @@ const response = await fetch('/api/issues/bulk', {
             </div>
           </CardContent>
         </Card>
+        */}
 
         {user?.isAdmin && (
           <Card>

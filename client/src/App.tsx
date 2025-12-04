@@ -12,22 +12,27 @@ import NotFound from "@/pages/not-found";
 import Landing from "@/pages/landing";
 import Onboarding from "@/pages/onboarding";
 import Dashboard from "@/pages/dashboard";
+import Team from "@/pages/team";
+import Settings from "@/pages/settings";
 import IssuesList from "@/pages/issues-list";
 import IssueDetail from "@/pages/issue-detail";
 import IssueNew from "@/pages/issue-new";
 import IssueEdit from "@/pages/issue-edit";
 import TeamChat from "@/pages/team-chat";
-import Team from "@/pages/team";
-import Settings from "@/pages/settings";
-import PublicChat from "@/pages/public-chat";
+import CustomerChatPage from "@/pages/chat-customer";
 import TrialExpired from "@/pages/trial-expired";
-import AccountsPayable from "@/pages/ap";
-import AccountsReceivable from "@/pages/ar";
-import Procurement from "@/pages/procurement";
+import AccountsPayable from "@/pages/payables";
+import AccountsReceivable from "@/pages/recievables";
+import VendorsPage from "@/pages/vendors";
 import { InvoiceView } from "@/pages/invoice-view";
 import { Skeleton } from "@/components/ui/skeleton";
 import { isTrialExpired } from "@shared/trial";
 import type { Workspace } from "@shared/schema";
+import VendorChatPage from "@/pages/chat-vendor";
+import ProposalView from "@/pages/proposal-view";
+import RfpView from "@/pages/rfp-view";
+import VendorProfile from "@/pages/vendor-profile";
+import VendorInvoiceSubmission from "@/pages/vendor-invoice";
 
 function LoadingScreen() {
   return (
@@ -74,7 +79,9 @@ function Router() {
   // Public routes that don't require authentication
   const publicRoutes = (
     <Switch>
-      <Route path="/chat/:slug" component={PublicChat} />
+      <Route path="/chat/customer" component={CustomerChatPage} />
+      <Route path="/chat/vendor" component={VendorChatPage} />
+      <Route path="/vendor/invoice" component={VendorInvoiceSubmission} />
       <Route path="/" component={Landing} />
       <Route component={Landing} />
     </Switch>
@@ -94,7 +101,8 @@ function Router() {
   if (!user?.onboardingCompleted) {
     return (
       <Switch>
-        <Route path="/chat/:slug" component={PublicChat} />
+        <Route path="/chat/customer" component={CustomerChatPage} />
+        <Route path="/chat/vendor" component={VendorChatPage} />
         <Route component={() => <Onboarding isNewWorkspace={!user?.workspaceId} />} />
       </Switch>
     );
@@ -108,7 +116,12 @@ function Router() {
   // Fully authenticated with completed onboarding and valid trial
   return (
     <Switch>
-      <Route path="/chat/:slug" component={PublicChat} />
+      <Route path="/chat/customer" component={CustomerChatPage} />
+      <Route path="/chat/vendor" component={VendorChatPage} />
+      <Route path="/rfp-view/:id" component={RfpView} />
+      <Route path="/proposal-view/:id" component={ProposalView} />
+      <Route path="/vendor-profile" component={VendorProfile} />
+      <Route path="/vendor/invoice" component={VendorInvoiceSubmission} />
       <Route path="/">
         <AuthenticatedLayout>
           <Dashboard />
@@ -139,20 +152,25 @@ function Router() {
           <IssueDetail />
         </AuthenticatedLayout>
       </Route>
-      <Route path="/ap">
+      <Route path="/payables">
         <AuthenticatedLayout>
           <AccountsPayable />
         </AuthenticatedLayout>
       </Route>
-      <Route path="/ar">
+      <Route path="/recievables">
         <AuthenticatedLayout>
           <AccountsReceivable />
         </AuthenticatedLayout>
       </Route>
-      <Route path="/ar/invoices/:id" component={InvoiceView} />
+      <Route path="/reciecables/invoices/:id" component={InvoiceView} />
+      <Route path="/vendors">
+        <AuthenticatedLayout>
+          <VendorsPage />
+        </AuthenticatedLayout>
+      </Route>
       <Route path="/procurement">
         <AuthenticatedLayout>
-          <Procurement />
+          <VendorsPage />
         </AuthenticatedLayout>
       </Route>
       <Route path="/team">

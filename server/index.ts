@@ -3,9 +3,15 @@ import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
+import { runtimeEnvironmentConfig } from "./runtimeConfig";
 
 const app = express();
 const httpServer = createServer(app);
+app.locals.environment = runtimeEnvironmentConfig;
+log(
+  `Booting ${runtimeEnvironmentConfig.environment.toUpperCase()} environment (${runtimeEnvironmentConfig.baseUrl})`,
+  "environment",
+);
 
 // Export the app for Vercel
 export default app;

@@ -8,9 +8,68 @@ import { randomBytes } from "crypto";
 import { z } from "zod";
 import { calculateTrialEndDate } from "../shared/trial";
 import { calculateInvoiceTotals, validateLineItems, TAX_OPTIONS, type LineItem } from "./utils/calculations";
+import { getPusher, triggerChannelEvent } from "./pusher";
+import { createRfpMagicLinkToken, consumeRfpMagicLinkToken } from "./rfpMagicLinks";
+import {
+  ensureChannelWithMembers,
+  ensureStreamUser,
+  encodeStreamIdentifier,
+  getStreamChatServer,
+  getStreamEnvironment,
+  getStreamFeedClient,
+  sanitizeImageValue,
+  type StreamIdentity,
+} from "./stream";
 import Stripe from "stripe";
-
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+
+const toCents = (value?: number | null) => {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return 0;
+  }
+  return Math.round(Number(value) * 100);
+};
+
+
+const lineItemInputSchema = z.object({
+  description: z.string().min(1, "Description is required"),
+  quantity: z.coerce.number().int().min(1).default(1),
+  unitPrice: z.coerce.number().nonnegative().default(0),
+  totalPrice: z.coerce.number().nonnegative().optional(),
+  category: z.string().optional(),
+});
+
+const purchaseInvoiceInputSchema = z.object({
+  vendorId: z.string().min(1),
+  poId: z.string().optional().nullable(),
+  invoiceNumber: z.string().optional(),
+  title: z.string().optional(),
+  description: z.string().optional().nullable(),
+  totalAmount: z.coerce.number().nonnegative(),
+  taxAmount: z.coerce.number().nonnegative().optional().default(0),
+  currency: z.string().optional(),
+  invoiceDate: z.string(),
+  dueDate: z.string().optional().nullable(),
+  status: z.string().optional(),
+  receiptImageUrl: z.string().optional().nullable(),
+  ocrData: z.any().optional(),
+  lineItems: z.array(lineItemInputSchema).optional(),
+});
+
+const vendorInvoiceSubmissionSchema = z.object({
+  vendorId: z.string().min(1),
+  rfpId: z.string().min(1),
+  invoiceNumber: z.string().optional(),
+  amount: z.coerce.number().positive(),
+  invoiceDate: z.string(),
+  dueDate: z.string().optional().nullable(),
+  contactEmail: z.string().email(),
+  description: z.string().optional().nullable(),
+  fileDataUrl: z.string().optional().nullable(),
+  fileName: z.string().optional().nullable(),
+});
 
 // Helper to generate random tokens
 function generateToken(length: number = 32): string {
@@ -31,6 +90,92 @@ function generateInvoiceNumber(workspaceId: string): string {
   return `INV-${timestamp}-${random}`;
 }
 
+const parseDateInput = (raw?: string | null) => {
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+};
+
+const isProduction = process.env.NODE_ENV === "production";
+const getRfpChatCookieName = (rfpId: string) => `rfp_chat_${rfpId}`;
+const getIssueChatCookieName = (issueId: string) => `issue_chat_${issueId}`;
+
+function readRfpVendorCookie(req: any, rfpId: string) {
+  const cookie = req.cookies?.[getRfpChatCookieName(rfpId)];
+  if (!cookie) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(cookie, "base64").toString());
+    if (parsed?.email && typeof parsed.email === "string") {
+      return parsed.email.toLowerCase();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveRfpChatViewer(req: any, rfp: any) {
+  const vendorEmail = readRfpVendorCookie(req, rfp.id);
+  if (vendorEmail) {
+    return { type: "vendor" as const, email: vendorEmail };
+  }
+  const userId = req.user?.claims?.sub;
+  if (userId) {
+    const user = await storage.getUser(userId);
+    if (user?.workspaceId && user.workspaceId === rfp.workspaceId) {
+      return { type: "internal" as const, user };
+    }
+  }
+  return { type: "anonymous" as const };
+}
+
+function readIssueChatCookie(req: any, issueId: string) {
+  const cookie = req.cookies?.[getIssueChatCookieName(issueId)];
+  if (!cookie) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(cookie, "base64").toString());
+    if (parsed && typeof parsed === "object") {
+      return {
+        name: typeof parsed.name === "string" ? parsed.name : undefined,
+        email: typeof parsed.email === "string" ? parsed.email : undefined,
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function resolveIssueChatViewer(req: any, issue: any) {
+  const cookie = readIssueChatCookie(req, issue.id);
+  if (cookie?.name) {
+    return { type: "contact" as const, ...cookie };
+  }
+  const userId = req.user?.claims?.sub;
+  if (userId) {
+    const user = await storage.getUser(userId);
+    if (user?.workspaceId && user.workspaceId === issue.workspaceId) {
+      return { type: "internal" as const, user };
+    }
+  }
+  return { type: "anonymous" as const };
+}
+
+function normalizeStreamActor(actor: any) {
+  if (!actor) {
+    return { id: "unknown", name: "Unknown" };
+  }
+  if (typeof actor === "string") {
+    const [, rawId] = actor.split(":");
+    return { id: rawId || actor, name: rawId || "Unknown" };
+  }
+  const id = actor.id || actor.data?.id || "unknown";
+  const name = actor.name || actor.data?.name || "Unknown";
+  const image = actor.image || actor.data?.image || actor.data?.profileImage || null;
+  return { id, name, image };
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -47,6 +192,38 @@ export async function registerRoutes(
     } catch (error) {
       console.error("Error fetching user:", error);
       res.status(500).json({ message: "Failed to fetch user" });
+    }
+  });
+
+  app.get("/api/rfp/chat/verify", async (req: any, res) => {
+    try {
+      const { token, email, id } = req.query as { token?: string; email?: string; id?: string };
+      if (!token || !email || !id) {
+        return res.status(400).json({ message: "Missing token, email, or id" });
+      }
+
+      const rfp = await storage.getRfp(id);
+      if (!rfp) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const valid = consumeRfpMagicLinkToken(token, id, email);
+      if (!valid) {
+        return res.status(401).json({ message: "Invalid or expired magic link" });
+      }
+
+      const cookieValue = Buffer.from(JSON.stringify({ email: email.toLowerCase() })).toString("base64");
+      res.cookie(getRfpChatCookieName(id), cookieValue, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: isProduction,
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error verifying RFP chat link:", error);
+      res.status(500).json({ message: "Failed to verify magic link" });
     }
   });
 
@@ -410,6 +587,37 @@ export async function registerRoutes(
     }
   });
 
+  app.delete("/api/issues/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "User not in a workspace" });
+      }
+
+      const issue = await storage.getIssue(req.params.id);
+      if (!issue) {
+        return res.status(404).json({ message: "Issue not found" });
+      }
+
+      if (issue.workspaceId !== user.workspaceId) {
+        return res.status(403).json({ message: "Not authorized to delete this issue" });
+      }
+
+      await storage.deleteIssue(issue.id);
+      await storage.createActivity({
+        issueId: issue.id,
+        userId,
+        action: "deleted",
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting issue:", error);
+      res.status(500).json({ message: "Failed to delete issue" });
+    }
+  });
+
   // Comments
   app.post("/api/issues/:id/comments", isAuthenticated, async (req: any, res) => {
     try {
@@ -478,6 +686,133 @@ export async function registerRoutes(
     }
   });
 
+  app.get("/api/issues/:id/feed", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      const issue = await storage.getIssue(req.params.id);
+      if (!issue) {
+        return res.status(404).json({ message: "Issue not found" });
+      }
+      if (!user?.workspaceId || user.workspaceId !== issue.workspaceId) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+
+      const feedClient = getStreamFeedClient();
+      if (!feedClient) {
+        return res.status(503).json({ message: "Activity feed is not configured" });
+      }
+
+      const feed = feedClient.feed("issue", issue.id);
+      const response = await feed.get({ limit: 50, enrich: true });
+      const entries = response.results.map((activity: any) => {
+        const actor = normalizeStreamActor(activity.actor);
+        return {
+          id: activity.id,
+          text: activity.text || activity.message || "",
+          createdAt: activity.time,
+          actor,
+          mentions: activity.mentions || [],
+          attachments: activity.attachments || [],
+        };
+      });
+
+      res.json(entries);
+    } catch (error) {
+      console.error("Error fetching issue feed:", error);
+      res.status(500).json({ message: "Failed to load activity feed" });
+    }
+  });
+
+  app.post("/api/issues/:id/feed", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      const issue = await storage.getIssue(req.params.id);
+
+      if (!issue) {
+        return res.status(404).json({ message: "Issue not found" });
+      }
+      if (!user?.workspaceId || user.workspaceId !== issue.workspaceId) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+
+      const { content } = req.body || {};
+      if (!content || typeof content !== "string" || !content.trim()) {
+        return res.status(400).json({ message: "Content is required" });
+      }
+
+      const feedClient = getStreamFeedClient();
+      if (!feedClient) {
+        return res.status(503).json({ message: "Activity feed is not configured" });
+      }
+
+      const identity: StreamIdentity = {
+        id: user.id,
+        name:
+          `${user.firstName || ""} ${user.lastName || ""}`.trim() ||
+          user.email ||
+          "Workspace user",
+        image: sanitizeImageValue(user.profileImageUrl),
+        email: user.email,
+      };
+      await ensureStreamUser(identity);
+
+      const mentions = Array.from(content.matchAll(/@(\w+)/g)).map((match) => match[1]);
+
+      const feed = feedClient.feed("issue", issue.id);
+      const activity = await feed.addActivity({
+        actor: `user:${user.id}`,
+        verb: "note",
+        object: `issue:${issue.id}`,
+        text: content.trim(),
+        issueId: issue.id,
+        mentions,
+      });
+
+      res.json({
+        id: activity.id,
+        text: activity.text,
+        createdAt: activity.time,
+        actor: identity,
+        mentions,
+      });
+    } catch (error) {
+      console.error("Error posting to issue feed:", error);
+      res.status(500).json({ message: "Failed to post to feed" });
+    }
+  });
+
+  app.delete("/api/issues/:issueId/feed/:activityId", isAuthenticated, async (req: any, res) => {
+    try {
+      const { issueId, activityId } = req.params;
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      const issue = await storage.getIssue(issueId);
+      if (!issue) {
+        return res.status(404).json({ message: "Issue not found" });
+      }
+      if (!user?.workspaceId || user.workspaceId !== issue.workspaceId) {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+      if (!user.isAdmin) {
+        return res.status(403).json({ message: "Only admins can delete feed entries" });
+      }
+
+      const feedClient = getStreamFeedClient();
+      if (!feedClient) {
+        return res.status(503).json({ message: "Activity feed is not configured" });
+      }
+
+      const feed = feedClient.feed("issue", issue.id);
+      await feed.removeActivity(activityId);
+      res.status(204).end();
+    } catch (error) {
+      console.error("Error deleting issue feed activity:", error);
+      res.status(500).json({ message: "Failed to delete activity" });
+    }
+  });
+
   // Publish issue
   app.post("/api/issues/:id/publish", isAuthenticated, async (req: any, res) => {
     try {
@@ -527,6 +862,63 @@ export async function registerRoutes(
     } catch (error) {
       console.error("Error unpublishing issue:", error);
       res.status(500).json({ message: "Failed to unpublish issue" });
+    }
+  });
+
+  app.post("/api/pusher/auth", (req, res) => {
+    const pusher = getPusher();
+    if (!pusher) {
+      return res.status(503).json({ message: "Realtime service is disabled" });
+    }
+
+    const socketId = req.body?.socket_id || req.body?.socketId;
+    const channelName = req.body?.channel_name || req.body?.channelName;
+
+    if (!socketId || !channelName) {
+      return res.status(400).json({ message: "Missing socket or channel identifiers" });
+    }
+
+    const {
+      participantId,
+      participantName,
+      participantEmail,
+      participantAvatar,
+    } = req.query as Record<string, string | undefined>;
+
+    const userId =
+      (participantId && participantId.toString()) ||
+      (participantEmail && participantEmail.toString()) ||
+      generateToken(6);
+
+    const displayName =
+      (participantName && participantName.toString()) ||
+      (participantEmail && participantEmail.toString()) ||
+      "Guest";
+
+    const presenceData = {
+      user_id: userId,
+      user_info: {
+        name: displayName,
+        email: participantEmail,
+        avatar: participantAvatar,
+      },
+    };
+
+    try {
+      if (channelName.startsWith("presence-")) {
+        const auth = pusher.authorizeChannel(socketId, channelName, presenceData);
+        return res.send(auth);
+      }
+
+      if (channelName.startsWith("private-")) {
+        const auth = pusher.authorizeChannel(socketId, channelName);
+        return res.send(auth);
+      }
+
+      return res.status(400).json({ message: "Unsupported channel type" });
+    } catch (error) {
+      console.error("Pusher auth error:", error);
+      return res.status(500).json({ message: "Failed to authorize channel" });
     }
   });
 
@@ -623,6 +1015,367 @@ export async function registerRoutes(
     }
   });
 
+  app.get("/api/chat/customer/auth", (req, res) => {
+    const { issueId } = req.query as { issueId?: string };
+    if (!issueId) {
+      return res.status(400).json({ message: "issueId is required" });
+    }
+    const cookie = readIssueChatCookie(req, issueId);
+    if (!cookie) {
+      return res.json({ authenticated: false });
+    }
+    res.json({
+      authenticated: true,
+      name: cookie.name,
+      email: cookie.email,
+    });
+  });
+
+  app.post("/api/chat/customer/verify", async (req, res) => {
+    try {
+      const { issueId, passcode, name, email } = req.body || {};
+      if (!issueId || !passcode || !name) {
+        return res.status(400).json({ message: "issueId, name, and passcode are required" });
+      }
+      const issue = await storage.getIssue(issueId);
+      if (!issue || !issue.isPublished) {
+        return res.status(404).json({ message: "Chat not found" });
+      }
+      if (issue.publishedPasscode !== passcode) {
+        return res.status(401).json({ message: "Invalid passcode" });
+      }
+
+      const cookieValue = Buffer.from(
+        JSON.stringify({ name, email: typeof email === "string" ? email.toLowerCase() : undefined }),
+      ).toString("base64");
+
+      res.cookie(getIssueChatCookieName(issue.id), cookieValue, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: isProduction,
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+      });
+
+      res.json({
+        success: true,
+        contactEmail: issue.contactEmail,
+        issueId: issue.id,
+      });
+    } catch (error) {
+      console.error("Error verifying customer chat:", error);
+      res.status(500).json({ message: "Failed to verify chat access" });
+    }
+  });
+
+  app.get("/api/stream/chat/customer", async (req: any, res) => {
+    try {
+      const { issueId } = req.query as { issueId?: string };
+      if (!issueId) {
+        return res.status(400).json({ message: "issueId is required" });
+      }
+
+      const issue = await storage.getIssueWithDetails(issueId);
+      if (!issue || !issue.isPublished) {
+        return res.status(404).json({ message: "Chat not found" });
+      }
+
+      const viewer = await resolveIssueChatViewer(req, issue);
+      if (viewer.type === "anonymous") {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      const chat = getStreamChatServer();
+      const streamEnv = getStreamEnvironment();
+      if (!chat || !streamEnv.key) {
+        return res.status(503).json({ message: "Stream chat is not configured" });
+      }
+
+      const viewerIdentity =
+        viewer.type === "internal"
+          ? {
+              id: viewer.user.id,
+              name:
+                `${viewer.user.firstName || ""} ${viewer.user.lastName || ""}`.trim() ||
+                viewer.user.email ||
+                "Workspace user",
+              image: sanitizeImageValue(viewer.user.profileImageUrl),
+              email: viewer.user.email,
+            }
+          : {
+              id: encodeStreamIdentifier(
+                `issue-${issue.id}-contact`,
+                viewer.email || viewer.name || `guest-${Date.now()}`,
+              ),
+              name: viewer.name || viewer.email || "Guest",
+              email: viewer.email,
+            };
+
+      const teamIdentities: StreamIdentity[] = [];
+      const identityDirectory = new Map<string, StreamIdentity>();
+      const registerIdentity = (identity?: StreamIdentity | null) => {
+        if (!identity) return;
+        identityDirectory.set(identity.id, identity);
+      };
+
+      const seenInternal = new Set<string>();
+      const pushInternal = (user: any) => {
+        if (!user?.id || seenInternal.has(user.id)) return;
+        seenInternal.add(user.id);
+        const identity: StreamIdentity = {
+          id: user.id,
+          name: `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "Workspace user",
+          image: sanitizeImageValue(user.profileImageUrl),
+          email: user.email,
+        };
+        teamIdentities.push(identity);
+        registerIdentity(identity);
+      };
+
+      if (issue.createdBy) {
+        pushInternal(issue.createdBy);
+      }
+      (issue.assignees || []).forEach((assignee: any) => pushInternal(assignee));
+
+      let contactIdentity: StreamIdentity | null = null;
+      if (viewer.type === "contact") {
+        contactIdentity = {
+          ...viewerIdentity,
+          image: sanitizeImageValue(viewerIdentity.image),
+        };
+      } else if (issue.contactEmail || issue.contactName) {
+        contactIdentity = {
+          id: encodeStreamIdentifier(
+            `issue-${issue.id}-contact`,
+            issue.contactEmail || issue.contactName || "contact",
+          ),
+          name: issue.contactName || issue.contactEmail || "Client",
+          email: issue.contactEmail || undefined,
+          image: sanitizeImageValue(issue.createdBy?.clientLogoUrl),
+        };
+      }
+
+      registerIdentity(viewerIdentity);
+      registerIdentity(contactIdentity);
+
+      await Promise.all(
+        Array.from(identityDirectory.values()).map(async (identity) => ensureStreamUser(identity)),
+      );
+
+      const memberIds = new Set<string>();
+      teamIdentities.forEach((identity) => memberIds.add(identity.id));
+      if (contactIdentity) {
+        memberIds.add(contactIdentity.id);
+      }
+
+      const channelId = encodeStreamIdentifier("issue", issue.id);
+      const createdById =
+        viewer.type === "internal"
+          ? viewer.user.id
+          : teamIdentities[0]?.id || contactIdentity?.id || viewerIdentity.id;
+
+      const channel = chat.channel("messaging", channelId, {
+        name: issue.chatTitle || issue.title,
+        issue_id: issue.id,
+        issue_number: issue.issueNumber,
+        workspace_id: issue.workspaceId,
+        created_by_id: createdById,
+      });
+      await ensureChannelWithMembers(channel, Array.from(memberIds));
+
+      const token = chat.createToken(viewerIdentity.id);
+
+      res.json({
+        apiKey: streamEnv.key,
+        appId: streamEnv.appId,
+        token,
+        user: viewerIdentity,
+        channel: {
+          id: channelId,
+          type: "messaging",
+          name: issue.chatTitle || issue.title,
+          data: {
+            issueId: issue.id,
+            issueNumber: issue.issueNumber,
+            workspaceId: issue.workspaceId,
+          },
+        },
+        context: {
+          type: "customer",
+          issue: {
+            id: issue.id,
+            title: issue.title,
+            issueNumber: issue.issueNumber,
+            status: issue.status,
+            contactName: issue.contactName,
+            contactEmail: issue.contactEmail,
+            contactCompany: issue.contactCompany,
+          },
+          contact: contactIdentity,
+          team: teamIdentities,
+        },
+      });
+    } catch (error) {
+      console.error("Error loading customer chat:", error);
+      res.status(500).json({ message: "Failed to load chat" });
+    }
+  });
+
+  app.get("/api/stream/chat/vendor", async (req: any, res) => {
+    try {
+      const { rfpId, email } = req.query as { rfpId?: string; email?: string };
+      if (!rfpId) {
+        return res.status(400).json({ message: "rfpId is required" });
+      }
+
+      const rfp = await storage.getRfp(rfpId);
+      if (!rfp) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const viewer = await resolveRfpChatViewer(req, rfp);
+      if (viewer.type === "anonymous") {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      const vendorEmailRaw =
+        viewer.type === "vendor"
+          ? viewer.email
+          : typeof email === "string"
+          ? email
+          : undefined;
+
+      if (!vendorEmailRaw) {
+        return res.status(400).json({ message: "Vendor email is required" });
+      }
+
+      if (vendorEmailRaw.length > 320) {
+        return res.status(400).json({ message: "Email is too long" });
+      }
+
+      const vendorEmail = vendorEmailRaw.toLowerCase();
+
+      const vendorRecord = await storage.getVendorByEmail(vendorEmail);
+      const proposals = await storage.getProposalsByRfpAndEmail(rfpId, vendorEmail);
+      if (viewer.type === "vendor" && proposals.length === 0) {
+        return res.status(403).json({ message: "No proposal found for this email" });
+      }
+
+      const latestProposal = proposals[0];
+      const vendorIdentity: StreamIdentity = {
+        id: vendorRecord?.id || encodeStreamIdentifier(`vendor-${rfpId}`, vendorEmail),
+        name:
+          vendorRecord?.name ||
+          latestProposal?.company ||
+          vendorEmail.split("@")[0] ||
+          "Vendor",
+        image: sanitizeImageValue(vendorRecord?.logoUrl || latestProposal?.vendorLogoUrl || undefined),
+        email: vendorEmail,
+      };
+
+      const chat = getStreamChatServer();
+      const streamEnv = getStreamEnvironment();
+      if (!chat || !streamEnv.key) {
+        return res.status(503).json({ message: "Stream chat is not configured" });
+      }
+
+      const viewerIdentity =
+        viewer.type === "internal"
+          ? {
+              id: viewer.user.id,
+              name:
+                `${viewer.user.firstName || ""} ${viewer.user.lastName || ""}`.trim() ||
+                viewer.user.email ||
+                "Workspace user",
+              image: sanitizeImageValue(viewer.user.profileImageUrl),
+              email: viewer.user.email,
+            }
+          : vendorIdentity;
+
+      const identityDirectory = new Map<string, StreamIdentity>();
+      const registerIdentity = (identity?: StreamIdentity | null) => {
+        if (!identity) return;
+        identityDirectory.set(identity.id, identity);
+      };
+
+      const teamMembersRaw = await storage.getUsersByWorkspace(rfp.workspaceId);
+      const teamIdentities: StreamIdentity[] = teamMembersRaw.map((member) => ({
+        id: member.id,
+        name:
+          `${member.firstName || ""} ${member.lastName || ""}`.trim() ||
+          member.email ||
+          "Workspace user",
+        image: sanitizeImageValue(member.profileImageUrl),
+        email: member.email,
+      }));
+      teamIdentities.forEach((identity) => registerIdentity(identity));
+
+      registerIdentity(vendorIdentity);
+      registerIdentity(viewerIdentity);
+
+      await Promise.all(
+        Array.from(identityDirectory.values()).map(async (identity) => ensureStreamUser(identity)),
+      );
+
+      const memberIds = new Set<string>();
+      teamIdentities.forEach((identity) => memberIds.add(identity.id));
+      memberIds.add(vendorIdentity.id);
+
+      const channelId = encodeStreamIdentifier("vendor", `${rfpId}-${vendorIdentity.id}`);
+      const channelCreatorId =
+        viewer.type === "internal"
+          ? viewer.user.id
+          : teamIdentities[0]?.id || vendorIdentity.id;
+
+      const channel = chat.channel("messaging", channelId, {
+        name: `${rfp.title} • ${vendorIdentity.name}`,
+        rfp_id: rfp.id,
+        vendor_email: vendorEmail,
+        created_by_id: channelCreatorId,
+      });
+      await ensureChannelWithMembers(channel, Array.from(memberIds));
+
+      const token = chat.createToken(viewerIdentity.id);
+
+      res.json({
+        apiKey: streamEnv.key,
+        appId: streamEnv.appId,
+        token,
+        user: viewerIdentity,
+        channel: {
+          id: channelId,
+          type: "messaging",
+          name: `${rfp.title} • ${vendorIdentity.name}`,
+          data: {
+            rfpId: rfp.id,
+            vendorEmail,
+            workspaceId: rfp.workspaceId,
+          },
+        },
+        context: {
+          type: "vendor",
+          rfp: {
+            id: rfp.id,
+            title: rfp.title,
+            companyName: rfp.companyName,
+            status: rfp.status,
+            deadline: rfp.deadline,
+          },
+          vendor: {
+            name: vendorIdentity.name,
+            email: vendorEmail,
+            logoUrl: vendorIdentity.image,
+            proposalCount: proposals.length,
+            latestProposalId: latestProposal?.id,
+          },
+          team: teamIdentities,
+        },
+      });
+    } catch (error) {
+      console.error("Error loading vendor chat:", error);
+      res.status(500).json({ message: "Failed to load chat" });
+    }
+  });
+
   // Team
   app.get("/api/team", isAuthenticated, async (req: any, res) => {
     try {
@@ -709,6 +1462,840 @@ export async function registerRoutes(
     } catch (error) {
       console.error("Error deleting invite:", error);
       res.status(500).json({ message: "Failed to delete invite" });
+    }
+  });
+
+  // Vendors
+  app.get("/api/vendors", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.json([]);
+      }
+      const vendors = await storage.getVendorsByWorkspace(user.workspaceId);
+      res.json(vendors);
+    } catch (error) {
+      console.error("Error fetching vendors:", error);
+      res.status(500).json({ message: "Failed to fetch vendors" });
+    }
+  });
+
+  app.post("/api/vendors", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "No workspace found" });
+      }
+
+      const payload = req.body || {};
+      if (!payload.name) {
+        return res.status(400).json({ message: "Vendor name is required" });
+      }
+
+      const vendor = await storage.createVendor({
+        workspaceId: user.workspaceId,
+        name: payload.name,
+        email: payload.email,
+        phone: payload.phone,
+        website: payload.website,
+        address: payload.address,
+        taxId: payload.taxId,
+        paymentTerms: payload.paymentTerms || "net_30",
+        bankAccountInfo: payload.bankAccountInfo || null,
+        isActive: payload.isActive ?? true,
+        rating: typeof payload.rating === "number" ? payload.rating : null,
+        notes: payload.notes,
+        createdById: userId,
+      });
+
+      res.json(vendor);
+    } catch (error) {
+      console.error("Error creating vendor:", error);
+      res.status(500).json({ message: "Failed to create vendor" });
+    }
+  });
+
+  app.get("/api/vendors/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const vendor = await storage.getVendor(req.params.id);
+      if (!vendor) {
+        return res.status(404).json({ message: "Vendor not found" });
+      }
+      res.json(vendor);
+    } catch (error) {
+      console.error("Error fetching vendor:", error);
+      res.status(500).json({ message: "Failed to fetch vendor" });
+    }
+  });
+
+  app.get("/api/vendor/profile", isAuthenticated, async (req: any, res) => {
+    try {
+      const { vendorId, email } = req.query as { vendorId?: string; email?: string };
+      if (!vendorId && !email) {
+        return res.status(400).json({ message: "vendorId or email is required" });
+      }
+
+      const vendor = vendorId
+        ? await storage.getVendor(vendorId)
+        : email
+        ? await storage.getVendorByEmail(email)
+        : null;
+
+      if (!vendor) {
+        return res.status(404).json({ message: "Vendor not found" });
+      }
+
+      const ratings = await storage.getSupplierRatingsByVendor(vendor.id);
+      res.json({ vendor, ratings });
+    } catch (error) {
+      console.error("Error loading vendor profile:", error);
+      res.status(500).json({ message: "Failed to load vendor profile" });
+    }
+  });
+
+  app.get("/api/vendor/invoice/context", async (req, res) => {
+    try {
+      const vendorId = typeof req.query.vendorId === "string" ? req.query.vendorId : "";
+      const rfpId = typeof req.query.rfpId === "string" ? req.query.rfpId : "";
+      if (!vendorId || !rfpId) {
+        return res.status(400).json({ message: "vendorId and rfpId are required" });
+      }
+
+      const vendor = await storage.getVendor(vendorId);
+      const rfp = await storage.getRfp(rfpId);
+      if (!vendor || !rfp || vendor.workspaceId !== rfp.workspaceId) {
+        return res.status(404).json({ message: "Unable to locate that vendor/RFP pairing" });
+      }
+
+      const workspace = vendor.workspaceId ? await storage.getWorkspace(vendor.workspaceId) : null;
+      const buyerEmail = workspace?.billingEmail || null;
+      const buyerName = workspace?.name || rfp.companyName || "Buyer";
+
+      res.json({
+        vendor: {
+          id: vendor.id,
+          name: vendor.name,
+          email: vendor.email,
+        },
+        rfp: {
+          id: rfp.id,
+          title: rfp.title,
+          companyName: rfp.companyName,
+          companyLogo: rfp.companyLogo,
+        },
+        buyer: {
+          name: buyerName,
+          email: buyerEmail,
+        },
+      });
+    } catch (error) {
+      console.error("Error loading vendor invoice context:", error);
+      res.status(500).json({ message: "Failed to load vendor invoice context" });
+    }
+  });
+
+  app.post("/api/vendor/invoice/submit", async (req, res) => {
+    try {
+      const parsed = vendorInvoiceSubmissionSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: parsed.error.flatten().formErrors.join(", ") });
+      }
+      const data = parsed.data;
+      const vendor = await storage.getVendor(data.vendorId);
+      const rfp = await storage.getRfp(data.rfpId);
+      if (!vendor || !rfp || vendor.workspaceId !== rfp.workspaceId) {
+        return res.status(404).json({ message: "Unable to locate that vendor/RFP pairing" });
+      }
+
+      const normalizedContact = data.contactEmail.toLowerCase();
+      if (vendor.email && vendor.email.toLowerCase() !== normalizedContact) {
+        return res.status(403).json({
+          message: "Please use the email address that was registered for this vendor.",
+        });
+      }
+
+      const invoiceDate = parseDateInput(data.invoiceDate) ?? new Date();
+      const dueDate = parseDateInput(data.dueDate) ?? null;
+      const receiptImageUrl =
+        data.fileDataUrl && data.fileDataUrl.startsWith("data:") ? data.fileDataUrl : null;
+
+      const invoiceNumber = data.invoiceNumber?.trim() || generateInvoiceNumber(vendor.workspaceId);
+      const invoice = await storage.createPurchaseInvoice({
+        workspaceId: vendor.workspaceId,
+        vendorId: vendor.id,
+        poId: null,
+        invoiceNumber,
+        title: invoiceNumber,
+        description: data.description,
+        status: "submitted",
+        totalAmount: toCents(data.amount),
+        taxAmount: 0,
+        currency: "USD",
+        invoiceDate,
+        dueDate,
+        receiptImageUrl,
+        approvedById: null,
+        approvedAt: null,
+        createdById: null,
+        ocrData: {
+          submittedVia: "vendor-portal",
+          contactEmail: data.contactEmail,
+          rfpId: data.rfpId,
+          originalFileName: data.fileName,
+        },
+      });
+
+      res.json({ invoiceId: invoice.id });
+    } catch (error) {
+      console.error("Vendor invoice submission failed:", error);
+      res.status(500).json({ message: "Failed to submit invoice" });
+    }
+  });
+
+
+  app.get("/api/payables/purchase-invoices", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.json({
+          invoices: [],
+          vendors: [],
+          stats: {
+            totalInvoices: 0,
+            outstandingAmount: 0,
+            overdueCount: 0,
+            dueSoonCount: 0,
+            paidThisMonth: 0,
+          },
+        });
+      }
+
+      const [invoices, vendors] = await Promise.all([
+        storage.getPurchaseInvoicesByWorkspace(user.workspaceId),
+        storage.getVendorsByWorkspace(user.workspaceId),
+      ]);
+
+      const vendorById = new Map(vendors.map((vendor) => [vendor.id, vendor]));
+      const enrichedInvoices = await Promise.all(
+        invoices.map(async (invoice) => {
+          const invoiceLineItems = await storage.getInvoiceLineItems(invoice.id);
+          return {
+            ...invoice,
+            vendor: vendorById.get(invoice.vendorId) || null,
+            lineItems: invoiceLineItems,
+          };
+        })
+      );
+
+      const outstanding = enrichedInvoices.filter(
+        (invoice) => invoice.status !== "paid" && invoice.status !== "cancelled"
+      );
+      const now = new Date();
+      const overdueCount = enrichedInvoices.filter((invoice) => {
+        if (!invoice.dueDate || invoice.status === "paid") return false;
+        return new Date(invoice.dueDate) < now;
+      }).length;
+      const dueSoonCount = enrichedInvoices.filter((invoice) => {
+        if (!invoice.dueDate || invoice.status === "paid") return false;
+        const due = new Date(invoice.dueDate).getTime();
+        const diff = due - now.getTime();
+        return diff > 0 && diff <= FOURTEEN_DAYS_MS;
+      }).length;
+      const paidThisMonth = enrichedInvoices
+        .filter((invoice) => invoice.status === "paid" && invoice.paidDate)
+        .filter((invoice) => {
+          const paidDate = new Date(invoice.paidDate!);
+          return (
+            paidDate.getMonth() === now.getMonth() && paidDate.getFullYear() === now.getFullYear()
+          );
+        })
+        .reduce((sum, invoice) => sum + invoice.totalAmount, 0);
+
+      res.json({
+        invoices: enrichedInvoices,
+        vendors,
+        stats: {
+          totalInvoices: invoices.length,
+          outstandingAmount: outstanding.reduce((sum, invoice) => sum + invoice.totalAmount, 0),
+          overdueCount,
+          dueSoonCount,
+          paidThisMonth,
+        },
+      });
+    } catch (error) {
+      console.error("Error fetching purchase invoices:", error);
+      res.status(500).json({ message: "Failed to fetch purchase invoices" });
+    }
+  });
+
+  app.post("/api/invoices/add", isAuthenticated, async (req: any, res) => {
+    try {
+      const parseResult = purchaseInvoiceInputSchema.safeParse(req.body);
+      if (!parseResult.success) {
+        return res.status(400).json({ message: parseResult.error.flatten().formErrors.join(", ") });
+      }
+
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "Workspace not found" });
+      }
+
+      const data = parseResult.data;
+      const invoiceRecord = {
+        workspaceId: user.workspaceId,
+        vendorId: data.vendorId,
+        poId: data.poId || null,
+        invoiceNumber: data.invoiceNumber || generateInvoiceNumber(user.workspaceId),
+        title: data.title || data.invoiceNumber || "Purchase invoice",
+        description: data.description,
+        status: data.status || "pending",
+        totalAmount: toCents(data.totalAmount),
+        taxAmount: toCents(data.taxAmount ?? 0),
+        currency: (data.currency || "USD").toUpperCase(),
+        invoiceDate: new Date(data.invoiceDate),
+        dueDate: data.dueDate ? new Date(data.dueDate) : null,
+        ocrData: data.ocrData,
+        receiptImageUrl: data.receiptImageUrl,
+        createdById: userId,
+      };
+
+      const invoice = await storage.createPurchaseInvoice(invoiceRecord);
+      const createdLineItems = [];
+      if (data.lineItems?.length) {
+        for (const item of data.lineItems) {
+          const newItem = await storage.createInvoiceLineItem({
+            invoiceId: invoice.id,
+            description: item.description,
+            quantity: item.quantity,
+            unitPrice: toCents(item.unitPrice),
+            totalPrice: toCents(item.totalPrice ?? item.unitPrice * item.quantity),
+            category: item.category,
+          });
+          createdLineItems.push(newItem);
+        }
+      }
+
+      const vendor = await storage.getVendor(invoice.vendorId);
+      res.json({ invoice: { ...invoice, vendor }, lineItems: createdLineItems });
+    } catch (error) {
+      console.error("Error creating purchase invoice:", error);
+      res.status(500).json({ message: "Failed to create purchase invoice" });
+    }
+  });
+
+  app.get("/api/rfps", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.json([]);
+      }
+      const rfps = await storage.getRfpsByWorkspace(user.workspaceId);
+      res.json(rfps);
+    } catch (error) {
+      console.error("Error fetching RFPs:", error);
+      res.status(500).json({ message: "Failed to fetch RFPs" });
+    }
+  });
+
+  app.get("/api/rfps/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      const rfp = await storage.getRfp(req.params.id);
+      if (!user?.workspaceId || !rfp || rfp.workspaceId !== user.workspaceId) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+      res.json(rfp);
+    } catch (error) {
+      console.error("Error fetching RFP:", error);
+      res.status(500).json({ message: "Failed to fetch RFP" });
+    }
+  });
+
+  app.get("/api/rfp/chat/:id", async (req: any, res) => {
+    try {
+      const rfpId = req.params.id;
+      const requestedEmail = typeof req.query.email === "string" ? req.query.email.toLowerCase() : undefined;
+      const rfp = await storage.getRfp(rfpId);
+      if (!rfp) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const viewer = await resolveRfpChatViewer(req, rfp);
+      if (viewer.type === "anonymous") {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      if (viewer.type === "vendor" && requestedEmail && requestedEmail !== viewer.email) {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      const targetEmail = viewer.type === "vendor" ? viewer.email : requestedEmail;
+      let vendorRecord =
+        targetEmail ? await storage.getVendorByEmail(targetEmail) : null;
+      if (vendorRecord && vendorRecord.workspaceId !== rfp.workspaceId) {
+        vendorRecord = null;
+      }
+
+      const proposals = targetEmail
+        ? await storage.getProposalsByRfpAndEmail(rfpId, targetEmail)
+        : await storage.getProposalsByRfp(rfpId);
+
+      if (viewer.type === "vendor" && proposals.length === 0) {
+        return res.status(403).json({ message: "No proposal found for this email" });
+      }
+
+      const teamMembersRaw = await storage.getUsersByWorkspace(rfp.workspaceId);
+      const teamMembers = teamMembersRaw.map((member) => ({
+        id: member.id,
+        firstName: member.firstName,
+        lastName: member.lastName,
+        email: member.email,
+        profileImageUrl: member.profileImageUrl,
+        role: member.role,
+      }));
+
+      const proposalIdsForViewer =
+        targetEmail ? proposals.map((proposal) => proposal.id).filter(Boolean) : null;
+
+      const communications = await storage.getVendorCommunications({
+        workspaceId: rfp.workspaceId,
+        rfpId,
+        vendorId: vendorRecord?.id || undefined,
+        proposalIds: !vendorRecord && proposalIdsForViewer && proposalIdsForViewer.length ? proposalIdsForViewer : undefined,
+      });
+
+      const serializedCommunications = communications.map((communication) => ({
+        ...communication,
+        createdAt: communication.createdAt ? new Date(communication.createdAt).toISOString() : communication.createdAt,
+        updatedAt: communication.updatedAt ? new Date(communication.updatedAt).toISOString() : communication.updatedAt,
+      }));
+
+      const normalizedProposals = proposals.map((proposal) => ({
+        id: proposal.id,
+        company: proposal.company,
+        status: proposal.status,
+        submittedAt: proposal.submittedAt ? new Date(proposal.submittedAt).toISOString() : proposal.submittedAt,
+      }));
+
+      const verifiedUser =
+        viewer.type === "vendor"
+          ? {
+              email: viewer.email,
+              proposals: proposals.map((proposal) => ({
+                id: proposal.id,
+                company: proposal.company,
+                firstName: proposal.firstName,
+                lastName: proposal.lastName,
+              })),
+            }
+          : viewer.type === "internal"
+          ? {
+              email: viewer.user.email,
+              proposals: proposals.map((proposal) => ({
+                id: proposal.id,
+                company: proposal.company,
+                firstName: proposal.firstName,
+                lastName: proposal.lastName,
+              })),
+            }
+          : undefined;
+
+      res.json({
+        rfp,
+        proposals: normalizedProposals,
+        verifiedUser,
+        teamMembers,
+        comments: [],
+        communications: serializedCommunications,
+        canModerate: viewer.type === "internal",
+      });
+    } catch (error) {
+      console.error("Error fetching RFP chat:", error);
+      res.status(500).json({ message: "Failed to fetch chat" });
+    }
+  });
+
+  app.post("/api/rfp/chat/:id/message", async (req: any, res) => {
+    try {
+      const rfpId = req.params.id;
+      const { content, parentId } = req.body || {};
+      if (!content || typeof content !== "string" || !content.trim()) {
+        return res.status(400).json({ message: "Content is required" });
+      }
+
+      const rfp = await storage.getRfp(rfpId);
+      if (!rfp) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const viewer = await resolveRfpChatViewer(req, rfp);
+      if (viewer.type === "anonymous") {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      let authorId: string | null = null;
+      let authorName = "Guest";
+      let authorEmail: string | null = null;
+      let direction: "outbound" | "inbound" = "outbound";
+      let isVendorMessage = false;
+      let proposalId: string | null = null;
+      let vendorId: string | null = null;
+
+      if (viewer.type === "vendor") {
+        direction = "inbound";
+        isVendorMessage = true;
+        authorEmail = viewer.email;
+        authorName = viewer.email.split("@")[0] || viewer.email;
+        const vendorProposals = await storage.getProposalsByRfpAndEmail(rfpId, viewer.email);
+        if (vendorProposals.length === 0) {
+          return res.status(403).json({ message: "No proposal found for this email" });
+        }
+        proposalId = vendorProposals[0].id;
+        const vendorRecord = await storage.getVendorByEmail(viewer.email);
+        vendorId = vendorRecord && vendorRecord.workspaceId === rfp.workspaceId ? vendorRecord.id : null;
+      } else if (viewer.type === "internal") {
+        direction = "outbound";
+        isVendorMessage = false;
+        authorId = viewer.user.id;
+        authorEmail = viewer.user.email;
+        authorName =
+          `${viewer.user.firstName || ""} ${viewer.user.lastName || ""}`.trim() ||
+          viewer.user.email ||
+          "Workspace user";
+      }
+
+      const communication = await storage.createVendorCommunication({
+        vendorId,
+        rfpId: rfp.id,
+        proposalId,
+        workspaceId: rfp.workspaceId,
+        content: content.trim(),
+        authorId,
+        authorName,
+        authorEmail,
+        channel: "chat",
+        direction,
+        isVendorMessage,
+        parentCommunicationId: parentId || null,
+      });
+
+      await triggerChannelEvent(`presence-rfp-chat-${rfp.id}`, "new-message", communication);
+      res.json(communication);
+    } catch (error) {
+      console.error("Error sending RFP chat message:", error);
+      res.status(500).json({ message: "Failed to send message" });
+    }
+  });
+
+  app.delete("/api/rfp/chat/:rfpId/message/:messageId", async (req: any, res) => {
+    try {
+      const { rfpId, messageId } = req.params;
+      const rfp = await storage.getRfp(rfpId);
+      if (!rfp) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const viewer = await resolveRfpChatViewer(req, rfp);
+      if (viewer.type !== "internal") {
+        return res.status(403).json({ message: "Not authorized" });
+      }
+
+      const message = await storage.getVendorCommunication(messageId);
+      if (!message || message.rfpId !== rfpId) {
+        return res.status(404).json({ message: "Message not found" });
+      }
+
+      await storage.deleteVendorCommunication(messageId);
+      res.json({ deletedIds: [messageId] });
+    } catch (error) {
+      console.error("Error deleting RFP chat message:", error);
+      res.status(500).json({ message: "Failed to delete message" });
+    }
+  });
+
+  app.post("/api/rfp/chat/:id/typing", async (req: any, res) => {
+    try {
+      const rfpId = req.params.id;
+      const rfp = await storage.getRfp(rfpId);
+      if (!rfp) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const viewer = await resolveRfpChatViewer(req, rfp);
+      if (viewer.type === "anonymous") {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      const providedName = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+      const displayName =
+        providedName ||
+        (viewer.type === "vendor"
+          ? viewer.email.split("@")[0] || viewer.email
+          : `${viewer.user.firstName || ""} ${viewer.user.lastName || ""}`.trim() ||
+            viewer.user.email ||
+            "Workspace user");
+
+      await triggerChannelEvent(`presence-rfp-chat-${rfpId}`, "typing", { name: displayName });
+      res.status(204).end();
+    } catch (error) {
+      console.error("Error broadcasting RFP typing event:", error);
+      res.status(500).json({ message: "Failed to broadcast typing event" });
+    }
+  });
+
+  app.post("/api/rfp/magic-link", async (req: any, res) => {
+    try {
+      const { email, rfpId } = req.body || {};
+      if (!email || !rfpId) {
+        return res.status(400).json({ message: "Email and rfpId are required" });
+      }
+
+      const rfp = await storage.getRfp(rfpId);
+      if (!rfp) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const token = createRfpMagicLinkToken(rfpId, email);
+      const protocol = req.protocol;
+      const host = req.get("host");
+      const chatLink = `${protocol}://${host}/chat/vendor?id=${rfpId}&email=${encodeURIComponent(email)}&token=${token}`;
+
+      await sendChatInvitation(email, chatLink, token, rfp.title);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error sending RFP magic link:", error);
+      res.status(500).json({ message: "Failed to send magic link" });
+    }
+  });
+
+  app.get("/api/proposals", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.json([]);
+      }
+      const proposals = await storage.getProposalsByWorkspace(user.workspaceId);
+      res.json(proposals);
+    } catch (error) {
+      console.error("Error fetching proposals:", error);
+      res.status(500).json({ message: "Failed to fetch proposals" });
+    }
+  });
+
+  app.post("/api/proposals", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "No workspace found" });
+      }
+
+      const payload = req.body || {};
+      if (!payload.rfpId) {
+        return res.status(400).json({ message: "rfpId is required" });
+      }
+
+      const rfp = await storage.getRfp(payload.rfpId);
+      if (!rfp || rfp.workspaceId !== user.workspaceId) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const requiredFields = ["firstName", "lastName", "email", "company", "teamSize", "hourlyRate"];
+      if (requiredFields.some((field) => !payload[field])) {
+        return res.status(400).json({ message: "Missing required proposal fields" });
+      }
+
+      const parseCurrency = (value: any) => {
+        if (value === undefined || value === null || value === "") return 0;
+        const numeric = typeof value === "string" ? parseFloat(value.replace(/[^0-9.]/g, "")) : Number(value);
+        return Number.isNaN(numeric) ? 0 : Math.round(numeric * 100);
+      };
+
+      const proposal = await storage.createProposal({
+        rfpId: rfp.id,
+        firstName: payload.firstName,
+        lastName: payload.lastName,
+        email: payload.email,
+        company: payload.company,
+        vendorLogoUrl: payload.vendorLogoUrl || null,
+        website: payload.website || null,
+        teamSize: payload.teamSize,
+        certifications: Array.isArray(payload.certifications)
+          ? payload.certifications
+          : typeof payload.certifications === "string" && payload.certifications.length
+          ? payload.certifications.split(",").map((item: string) => item.trim()).filter(Boolean)
+          : [],
+        hourlyRate: parseCurrency(payload.hourlyRate),
+        capabilitiesStatementUrl: payload.capabilitiesStatementUrl || null,
+        coverLetter: payload.coverLetter || null,
+        technicalApproach: payload.technicalApproach || null,
+        timeline: payload.timeline || null,
+        budget: parseCurrency(payload.budget),
+        status: payload.status || "submitted",
+      });
+
+      res.json(proposal);
+    } catch (error) {
+      console.error("Error creating proposal:", error);
+      res.status(500).json({ message: "Failed to submit proposal" });
+    }
+  });
+
+  app.get("/api/proposals/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(404).json({ message: "Proposal not found" });
+      }
+      const proposal = await storage.getProposalWithRfp(req.params.id);
+      if (!proposal || proposal.rfp.workspaceId !== user.workspaceId) {
+        return res.status(404).json({ message: "Proposal not found" });
+      }
+      res.json(proposal);
+    } catch (error) {
+      console.error("Error fetching proposal:", error);
+      res.status(500).json({ message: "Failed to fetch proposal" });
+    }
+  });
+
+  app.get("/api/vendor-communications", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.json([]);
+      }
+
+      const { vendorId, rfpId, email } = req.query as { vendorId?: string; rfpId?: string; email?: string };
+      const communications = await storage.getVendorCommunications({
+        workspaceId: user.workspaceId,
+        vendorId,
+        rfpId,
+        email,
+      });
+      res.json(communications);
+    } catch (error) {
+      console.error("Error fetching vendor communications:", error);
+      res.status(500).json({ message: "Failed to fetch communications" });
+    }
+  });
+
+  app.post("/api/vendor-communications/typing", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "No workspace found" });
+      }
+
+      const { vendorId, rfpId, name } = req.body || {};
+      if (!vendorId || !rfpId) {
+        return res.status(400).json({ message: "vendorId and rfpId are required" });
+      }
+
+      const vendor = await storage.getVendor(vendorId);
+      if (!vendor || vendor.workspaceId !== user.workspaceId) {
+        return res.status(404).json({ message: "Vendor not found" });
+      }
+
+      const rfp = await storage.getRfp(rfpId);
+      if (!rfp || rfp.workspaceId !== user.workspaceId) {
+        return res.status(404).json({ message: "RFP not found" });
+      }
+
+      const displayName =
+        (typeof name === "string" && name.trim()) ||
+        `${user.firstName || ""} ${user.lastName || ""}`.trim() ||
+        user.email ||
+        "Workspace user";
+
+      await triggerChannelEvent(
+        `presence-vendor-chat-${vendorId}-${rfpId}`,
+        "typing",
+        { name: displayName }
+      );
+
+      res.status(204).end();
+    } catch (error) {
+      console.error("Error broadcasting vendor typing event:", error);
+      res.status(500).json({ message: "Failed to broadcast typing event" });
+    }
+  });
+
+  app.post("/api/vendor-communications", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "No workspace found" });
+      }
+
+      const { vendorId, rfpId, proposalId, content } = req.body || {};
+      if (!content || typeof content !== "string" || !content.trim()) {
+        return res.status(400).json({ message: "Content is required" });
+      }
+
+      let vendor = null;
+      if (vendorId) {
+        vendor = await storage.getVendor(vendorId);
+        if (!vendor || vendor.workspaceId !== user.workspaceId) {
+          return res.status(404).json({ message: "Vendor not found" });
+        }
+      }
+
+      let rfp = null;
+      if (rfpId) {
+        rfp = await storage.getRfp(rfpId);
+        if (!rfp || rfp.workspaceId !== user.workspaceId) {
+          return res.status(404).json({ message: "RFP not found" });
+        }
+      }
+
+      const authorName = `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "Workspace user";
+
+      const communication = await storage.createVendorCommunication({
+        vendorId: vendor?.id || null,
+        rfpId: rfp?.id || null,
+        proposalId: proposalId || null,
+        workspaceId: user.workspaceId,
+        content: content.trim(),
+        authorId: userId,
+        authorName,
+        authorEmail: user.email,
+        channel: "chat",
+        direction: "outbound",
+        isVendorMessage: false,
+      });
+
+      if (communication.vendorId && communication.rfpId) {
+        await triggerChannelEvent(
+          `presence-vendor-chat-${communication.vendorId}-${communication.rfpId}`,
+          "new-message",
+          communication
+        );
+      }
+
+      if (communication.rfpId) {
+        await triggerChannelEvent(
+          `presence-rfp-chat-${communication.rfpId}`,
+          "new-message",
+          communication
+        );
+      }
+
+      res.json(communication);
+    } catch (error) {
+      console.error("Error creating vendor communication:", error);
+      res.status(500).json({ message: "Failed to send communication" });
     }
   });
 
@@ -1349,8 +2936,8 @@ export async function registerRoutes(
             workspaceId: workspace.id,
           },
         },
-        success_url: `${process.env.APP_URL}/ar/invoices/${invoice.id}?payment=success`,
-        cancel_url: `${process.env.APP_URL}/ar/invoices/${invoice.id}?payment=cancelled`,
+        success_url: `${process.env.APP_URL}/recievables/invoices/${invoice.id}?payment=success`,
+        cancel_url: `${process.env.APP_URL}/recievables/invoices/${invoice.id}?payment=cancelled`,
         metadata: {
           invoiceId: invoice.id,
           workspaceId: workspace.id,
@@ -1460,7 +3047,7 @@ export async function registerRoutes(
   // ==================== ACCOUNTS RECEIVABLE ====================
 
   // AR Dashboard Statistics
-  app.get("/api/ar/dashboard/stats", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/dashboard/stats", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -1545,7 +3132,7 @@ export async function registerRoutes(
   });
 
   // Customer Management
-  app.get("/api/ar/customers", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/customers", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -1560,7 +3147,7 @@ export async function registerRoutes(
     }
   });
 
-  app.get("/api/ar/customers/:id", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/customers/:id", isAuthenticated, async (req: any, res) => {
     try {
       const customer = await storage.getCustomer(req.params.id);
       if (!customer) {
@@ -1573,7 +3160,7 @@ export async function registerRoutes(
     }
   });
 
-  app.post("/api/ar/customers", isAuthenticated, async (req: any, res) => {
+  app.post("/api/recievables/customers", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -1605,7 +3192,7 @@ export async function registerRoutes(
     }
   });
 
-  app.patch("/api/ar/customers/:id", isAuthenticated, async (req: any, res) => {
+  app.patch("/api/recievables/customers/:id", isAuthenticated, async (req: any, res) => {
     try {
       const customer = await storage.updateCustomer(req.params.id, req.body);
       if (!customer) {
@@ -1618,7 +3205,7 @@ export async function registerRoutes(
     }
   });
 
-  app.delete("/api/ar/customers/:id", isAuthenticated, async (req: any, res) => {
+  app.delete("/api/recievables/customers/:id", isAuthenticated, async (req: any, res) => {
     try {
       await storage.deleteCustomer(req.params.id);
       res.json({ success: true });
@@ -1629,7 +3216,7 @@ export async function registerRoutes(
   });
 
   // Convert Issue to Customer
-  app.post("/api/ar/issues/:issueId/convert-to-customer", isAuthenticated, async (req: any, res) => {
+  app.post("/api/recievables/issues/:issueId/convert-to-customer", isAuthenticated, async (req: any, res) => {
     try {
       const customer = await storage.convertIssueToCustomer(req.params.issueId);
       if (!customer) {
@@ -1643,7 +3230,7 @@ export async function registerRoutes(
   });
 
   // Sales Invoice Management
-  app.get("/api/ar/invoices", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/invoices", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -1658,7 +3245,7 @@ export async function registerRoutes(
     }
   });
 
-  app.get("/api/ar/invoices/:id", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/invoices/:id", isAuthenticated, async (req: any, res) => {
     try {
       const invoice = await storage.getSalesInvoiceWithDetails(req.params.id);
       if (!invoice) {
@@ -1721,7 +3308,7 @@ export async function registerRoutes(
     }
   });
 
-  app.post("/api/ar/invoices", isAuthenticated, async (req: any, res) => {
+  app.post("/api/recievables/invoices", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -1814,7 +3401,7 @@ export async function registerRoutes(
   });
 
   // Publish/Send Invoice
-  app.post("/api/ar/invoices/:id/publish", isAuthenticated, async (req: any, res) => {
+  app.post("/api/recievables/invoices/:id/publish", isAuthenticated, async (req: any, res) => {
     try {
       const invoice = await storage.getSalesInvoiceWithDetails(req.params.id);
       if (!invoice) {
@@ -1836,7 +3423,7 @@ export async function registerRoutes(
         try {
           const protocol = req.protocol;
           const host = req.get("host");
-          const invoiceUrl = `${protocol}://${host}/ar/invoices/${invoice.id}`;
+          const invoiceUrl = `${protocol}://${host}/recievables/invoices/${invoice.id}`;
           
           console.log(`Sending invoice email to ${invoice.customer.email} for invoice ${invoice.invoiceNumber}`);
           
@@ -1867,7 +3454,7 @@ export async function registerRoutes(
     }
   });
 
-  app.patch("/api/ar/invoices/:id", isAuthenticated, async (req: any, res) => {
+  app.patch("/api/recievables/invoices/:id", isAuthenticated, async (req: any, res) => {
     try {
       const { lineItems, taxPercentage, ...updateData } = req.body;
       
@@ -1925,7 +3512,7 @@ export async function registerRoutes(
     }
   });
 
-  app.delete("/api/ar/invoices/:id", isAuthenticated, async (req: any, res) => {
+  app.delete("/api/recievables/invoices/:id", isAuthenticated, async (req: any, res) => {
     try {
       await storage.deleteSalesInvoice(req.params.id);
       res.json({ success: true });
@@ -1935,12 +3522,12 @@ export async function registerRoutes(
     }
   });
   // PDF generation removed - now using hosted pages approach
-  // Users can view invoices at /ar/invoices/:id and download as PDF using browser print function
+  // Users can view invoices at /recievables/invoices/:id and download as PDF using browser print function
 
 
 
   // Recurring Invoice Management
-  app.get("/api/ar/recurring-invoices", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/recurring-invoices", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -1955,7 +3542,7 @@ export async function registerRoutes(
     }
   });
 
-  app.post("/api/ar/recurring-invoices", isAuthenticated, async (req: any, res) => {
+  app.post("/api/recievables/recurring-invoices", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -1976,7 +3563,7 @@ export async function registerRoutes(
     }
   });
 
-  app.patch("/api/ar/recurring-invoices/:id", isAuthenticated, async (req: any, res) => {
+  app.patch("/api/recievables/recurring-invoices/:id", isAuthenticated, async (req: any, res) => {
     try {
       const recurringInvoice = await storage.updateRecurringInvoice(req.params.id, req.body);
       if (!recurringInvoice) {
@@ -1990,7 +3577,7 @@ export async function registerRoutes(
   });
 
   // Customer Payment Management
-  app.get("/api/ar/payments", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/payments", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -2005,7 +3592,7 @@ export async function registerRoutes(
     }
   });
 
-  app.post("/api/ar/payments", isAuthenticated, async (req: any, res) => {
+  app.post("/api/recievables/payments", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -2041,7 +3628,7 @@ export async function registerRoutes(
   });
 
   // Payment Method Management
-  app.get("/api/ar/payment-methods/:customerId", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/payment-methods/:customerId", isAuthenticated, async (req: any, res) => {
     try {
       const paymentMethods = await storage.getPaymentMethodsByCustomer(req.params.customerId);
       res.json(paymentMethods);
@@ -2051,7 +3638,7 @@ export async function registerRoutes(
     }
   });
 
-  app.post("/api/ar/payment-methods", isAuthenticated, async (req: any, res) => {
+  app.post("/api/recievables/payment-methods", isAuthenticated, async (req: any, res) => {
     try {
       const paymentMethod = await storage.createPaymentMethod(req.body);
       res.json(paymentMethod);
@@ -2061,7 +3648,7 @@ export async function registerRoutes(
     }
   });
 
-  app.patch("/api/ar/payment-methods/:id", isAuthenticated, async (req: any, res) => {
+  app.patch("/api/recievables/payment-methods/:id", isAuthenticated, async (req: any, res) => {
     try {
       const paymentMethod = await storage.updatePaymentMethod(req.params.id, req.body);
       if (!paymentMethod) {
@@ -2075,7 +3662,7 @@ export async function registerRoutes(
   });
 
   // AR Reports and Analytics
-  app.get("/api/ar/reports/aging", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/reports/aging", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -2118,7 +3705,7 @@ export async function registerRoutes(
     }
   });
 
-  app.get("/api/ar/reports/collection-insights", isAuthenticated, async (req: any, res) => {
+  app.get("/api/recievables/reports/collection-insights", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
       const user = await storage.getUser(userId);
@@ -2237,6 +3824,116 @@ export async function registerRoutes(
     } catch (error) {
       console.error("Error generating account link:", error);
       res.status(500).json({ message: "Failed to generate account link" });
+    }
+  });
+
+  // Procurement (Purchase Requisitions / Purchase Orders)
+  app.get("/api/procurement/requisitions", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.json([]);
+      }
+      const requisitions = await storage.getPurchaseRequisitionsByWorkspace(user.workspaceId);
+      res.json(requisitions);
+    } catch (error) {
+      console.error("Error fetching requisitions:", error);
+      res.status(500).json({ message: "Failed to fetch requisitions" });
+    }
+  });
+
+  app.post("/api/procurement/requisitions", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "No workspace found" });
+      }
+
+      const parseAmount = (value: any) => {
+        if (value === undefined || value === null || value === "") return 0;
+        const numeric = typeof value === "string" ? parseFloat(value) : Number(value);
+        return Number.isNaN(numeric) ? 0 : Math.round(numeric * 100);
+      };
+
+      const requisition = await storage.createPurchaseRequisition({
+        workspaceId: user.workspaceId,
+        requisitionNumber:
+          req.body.requisitionNumber || `REQ-${new Date().toISOString().replace(/[-:T.Z]/g, "").slice(2)}`,
+        title: req.body.title,
+        description: req.body.description,
+        requestedById: userId,
+        department: req.body.department,
+        urgency: req.body.urgency || "normal",
+        status: req.body.status || "submitted",
+        totalEstimatedAmount: parseAmount(req.body.totalEstimatedAmount),
+        currency: req.body.currency || "USD",
+        neededByDate: req.body.neededByDate ? new Date(req.body.neededByDate) : null,
+        approvedById: null,
+        approvedAt: null,
+        rejectedReason: null,
+      });
+
+      res.json(requisition);
+    } catch (error) {
+      console.error("Error creating requisition:", error);
+      res.status(500).json({ message: "Failed to create requisition" });
+    }
+  });
+
+  app.get("/api/procurement/purchase-orders", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.json([]);
+      }
+      const purchaseOrders = await storage.getPurchaseOrdersByWorkspace(user.workspaceId);
+      res.json(purchaseOrders);
+    } catch (error) {
+      console.error("Error fetching purchase orders:", error);
+      res.status(500).json({ message: "Failed to fetch purchase orders" });
+    }
+  });
+
+  app.post("/api/procurement/purchase-orders", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      if (!user?.workspaceId) {
+        return res.status(403).json({ message: "No workspace found" });
+      }
+
+      if (!req.body.vendorId) {
+        return res.status(400).json({ message: "vendorId is required" });
+      }
+
+      const parseAmount = (value: any) => {
+        if (value === undefined || value === null || value === "") return 0;
+        const numeric = typeof value === "string" ? parseFloat(value) : Number(value);
+        return Number.isNaN(numeric) ? 0 : Math.round(numeric * 100);
+      };
+
+      const po = await storage.createPurchaseOrder({
+        workspaceId: user.workspaceId,
+        poNumber: req.body.poNumber || `PO-${new Date().toISOString().replace(/[-:T.Z]/g, "").slice(2)}`,
+        vendorId: req.body.vendorId,
+        title: req.body.title,
+        description: req.body.description,
+        status: req.body.status || "draft",
+        totalAmount: parseAmount(req.body.totalAmount),
+        currency: req.body.currency || "USD",
+        requestedDeliveryDate: req.body.requestedDeliveryDate ? new Date(req.body.requestedDeliveryDate) : null,
+        approvedById: null,
+        approvedAt: null,
+        createdById: userId,
+      });
+
+      res.json(po);
+    } catch (error) {
+      console.error("Error creating purchase order:", error);
+      res.status(500).json({ message: "Failed to create purchase order" });
     }
   });
 

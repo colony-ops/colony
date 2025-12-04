@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -23,9 +24,24 @@ import {
   Upload
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
+import VendorsPage from "./vendors";
+import PurchaseInvoicesPage from "./purchase-invoices";
+import type { Vendor } from "@shared/schema";
+
+const fetchJSON = async <T,>(url: string): Promise<T> => {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
+};
 
 export default function AccountsPayable() {
   const { user } = useAuth();
+  const { data: vendors = [], isLoading: vendorsLoading } = useQuery<Vendor[]>({
+    queryKey: ["/api/vendors"],
+    queryFn: () => fetchJSON<Vendor[]>("/api/vendors"),
+  });
 
   // State for modals
   const [showVendorModal, setShowVendorModal] = useState(false);
@@ -84,7 +100,7 @@ export default function AccountsPayable() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold">Accounts Payable</h1>
+          <h1 className="text-3xl font-bold">Payables</h1>
           <p className="text-muted-foreground mt-1">
             Manage vendors, invoices, and payment processing
           </p>
@@ -193,47 +209,11 @@ export default function AccountsPayable() {
         </div>
 
         <TabsContent value="vendors" className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Vendors</CardTitle>
-              <CardDescription>
-                Manage your supplier relationships and vendor information
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="text-center py-12 text-muted-foreground">
-                <Building2 className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <h3 className="font-semibold mb-2">No vendors yet</h3>
-                <p className="text-sm mb-4">Add your first vendor to start managing invoices</p>
-                <Button onClick={() => setShowVendorModal(true)}>
-                  <Plus className="mr-2 h-4 w-4" />
-                  Add Vendor
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
+          <VendorsPage embedded />
         </TabsContent>
 
         <TabsContent value="invoices" className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Purchase Invoices</CardTitle>
-              <CardDescription>
-                Track and manage incoming invoices with 3-way matching
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="text-center py-12 text-muted-foreground">
-                <Receipt className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <h3 className="font-semibold mb-2">No invoices yet</h3>
-                <p className="text-sm mb-4">Capture invoices via OCR or manual entry</p>
-                <Button onClick={() => setShowInvoiceModal(true)}>
-                  <Plus className="mr-2 h-4 w-4" />
-                  Add Invoice
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
+          <PurchaseInvoicesPage embedded />
         </TabsContent>
 
         <TabsContent value="purchase-orders" className="space-y-4">
@@ -410,12 +390,34 @@ export default function AccountsPayable() {
             </div>
             <div className="grid gap-2">
               <Label htmlFor="invoiceVendor">Vendor *</Label>
-              <Select value={invoiceForm.vendorId} onValueChange={(value) => setInvoiceForm({...invoiceForm, vendorId: value})}>
+              <Select
+                value={invoiceForm.vendorId}
+                onValueChange={(value) => setInvoiceForm({...invoiceForm, vendorId: value})}
+                disabled={vendors.length === 0}
+              >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select vendor" />
+                  <SelectValue
+                    placeholder={
+                      vendorsLoading
+                        ? "Loading vendors..."
+                        : vendors.length === 0
+                        ? "Add a vendor first"
+                        : "Select vendor"
+                    }
+                  />
                 </SelectTrigger>
                 <SelectContent>
-                  {/* Vendors would be loaded here */}
+                  {vendors.length === 0 ? (
+                    <SelectItem value="no-vendors" disabled>
+                      No vendors available
+                    </SelectItem>
+                  ) : (
+                    vendors.map((vendor) => (
+                      <SelectItem key={vendor.id} value={vendor.id}>
+                        {vendor.name}
+                      </SelectItem>
+                    ))
+                  )}
                 </SelectContent>
               </Select>
             </div>
@@ -503,12 +505,34 @@ export default function AccountsPayable() {
             </div>
             <div className="grid gap-2">
               <Label htmlFor="poVendor">Vendor *</Label>
-              <Select value={poForm.vendorId} onValueChange={(value) => setPoForm({...poForm, vendorId: value})}>
+              <Select
+                value={poForm.vendorId}
+                onValueChange={(value) => setPoForm({...poForm, vendorId: value})}
+                disabled={vendors.length === 0}
+              >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select vendor" />
+                  <SelectValue
+                    placeholder={
+                      vendorsLoading
+                        ? "Loading vendors..."
+                        : vendors.length === 0
+                        ? "Add a vendor first"
+                        : "Select vendor"
+                    }
+                  />
                 </SelectTrigger>
                 <SelectContent>
-                  {/* Vendors would be loaded here */}
+                  {vendors.length === 0 ? (
+                    <SelectItem value="no-vendors" disabled>
+                      No vendors available
+                    </SelectItem>
+                  ) : (
+                    vendors.map((vendor) => (
+                      <SelectItem key={vendor.id} value={vendor.id}>
+                        {vendor.name}
+                      </SelectItem>
+                    ))
+                  )}
                 </SelectContent>
               </Select>
             </div>
@@ -651,12 +675,34 @@ export default function AccountsPayable() {
             </div>
             <div className="grid gap-2">
               <Label htmlFor="receiptVendor">Vendor *</Label>
-              <Select value={receiptForm.vendorId} onValueChange={(value) => setReceiptForm({...receiptForm, vendorId: value})}>
+              <Select
+                value={receiptForm.vendorId}
+                onValueChange={(value) => setReceiptForm({...receiptForm, vendorId: value})}
+                disabled={vendors.length === 0}
+              >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select vendor" />
+                  <SelectValue
+                    placeholder={
+                      vendorsLoading
+                        ? "Loading vendors..."
+                        : vendors.length === 0
+                        ? "Add a vendor first"
+                        : "Select vendor"
+                    }
+                  />
                 </SelectTrigger>
                 <SelectContent>
-                  {/* Vendors would be loaded here */}
+                  {vendors.length === 0 ? (
+                    <SelectItem value="no-vendors" disabled>
+                      No vendors available
+                    </SelectItem>
+                  ) : (
+                    vendors.map((vendor) => (
+                      <SelectItem key={vendor.id} value={vendor.id}>
+                        {vendor.name}
+                      </SelectItem>
+                    ))
+                  )}
                 </SelectContent>
               </Select>
             </div>

@@ -252,6 +252,10 @@ export const vendors = pgTable("vendors", {
   taxId: varchar("tax_id"),
   paymentTerms: varchar("payment_terms"), // net_30, net_60, etc.
   bankAccountInfo: jsonb("bank_account_info"), // Encrypted bank details
+  stripeConnectAccountId: varchar("stripe_connect_account_id"),
+  stripeTreasuryFinancialAccountId: varchar("stripe_treasury_financial_account_id"),
+  stripePayoutsEnabled: boolean("stripe_payouts_enabled").default(false),
+  stripeOnboardingStatus: varchar("stripe_onboarding_status"),
   isActive: boolean("is_active").default(true),
   rating: integer("rating"), // 1-5 stars
   notes: text("notes"),
@@ -526,6 +530,81 @@ export const paymentMethods = pgTable("payment_methods", {
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
+// ==================== REQUEST FOR PROPOSALS (RFP) ====================
+
+// RFPs
+export const rfps = pgTable("rfps", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: varchar("workspace_id").notNull().references(() => workspaces.id),
+  title: varchar("title").notNull(),
+  about: text("about"), // Rich text/markdown content - About the project
+  budget: text("budget"), // Budget information/range
+  responsibilities: text("responsibilities"), // What the vendor will be responsible for
+  process: text("process"), // Selection process and timeline
+  companyName: varchar("company_name").notNull(),
+  companyLogo: varchar("company_logo_url"),
+  status: varchar("status").notNull().default("draft"), // draft, published, closed, archived
+  deadline: timestamp("deadline"),
+  publishedAt: timestamp("published_at"),
+  createdById: varchar("created_by_id").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+// Proposals submitted by vendors
+export const proposals = pgTable("proposals", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  rfpId: varchar("rfp_id").notNull().references(() => rfps.id, { onDelete: "cascade" }),
+  // Vendor Information
+  firstName: varchar("first_name").notNull(),
+  lastName: varchar("last_name").notNull(),
+  email: varchar("email").notNull(),
+  company: varchar("company").notNull(),
+  vendorLogoUrl: varchar("vendor_logo_url"),
+  website: varchar("website"),
+  teamSize: varchar("team_size").notNull(),
+  certifications: text("certifications").array(), // Array of certification names
+  hourlyRate: integer("hourly_rate").notNull(), // in cents
+  capabilitiesStatementUrl: varchar("capabilities_statement_url"), // PDF file URL
+  // Proposal Content
+  coverLetter: text("cover_letter"),
+  technicalApproach: text("technical_approach"),
+  timeline: text("timeline"),
+  budget: integer("budget"), // in cents
+  status: varchar("status").notNull().default("submitted"), // submitted, under_review, accepted, rejected, withdrawn
+  submittedAt: timestamp("submitted_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+// Proposal Issues - Links proposals to issues for communication
+export const proposalIssues = pgTable("proposal_issues", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  proposalId: varchar("proposal_id").notNull().references(() => proposals.id, { onDelete: "cascade" }),
+  issueId: varchar("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+// Vendor Communications - General vendor-facing communication hub (chat, notes, notifications)
+export const vendorCommunications = pgTable("vendor_communications", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  vendorId: varchar("vendor_id").references(() => vendors.id, { onDelete: "cascade" }),
+  proposalId: varchar("proposal_id").references(() => proposals.id, { onDelete: "set null" }),
+  rfpId: varchar("rfp_id").references(() => rfps.id, { onDelete: "set null" }),
+  issueId: varchar("issue_id").references(() => issues.id, { onDelete: "set null" }),
+  workspaceId: varchar("workspace_id").references(() => workspaces.id),
+  parentCommunicationId: varchar("parent_communication_id").references(() => vendorCommunications.id, { onDelete: "cascade" }),
+  authorId: varchar("author_id").references(() => users.id),
+  authorName: varchar("author_name"), // For external vendor messages
+  authorEmail: varchar("author_email"), // For external vendor messages
+  channel: varchar("channel").notNull().default("chat"), // chat, email, notification
+  direction: varchar("direction").notNull().default("outbound"), // outbound (to vendor) / inbound (from vendor)
+  isVendorMessage: boolean("is_vendor_message").default(false),
+  content: text("content").notNull(),
+  metadata: jsonb("metadata"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
 // ==================== PROCUREMENT ====================
 
 // Purchase Requisitions
@@ -639,6 +718,12 @@ export const insertSupplierRatingSchema = createInsertSchema(supplierRatings).om
 export const insertSpendCategorySchema = createInsertSchema(spendCategories).omit({ createdAt: true, updatedAt: true });
 export const insertSpendTransactionSchema = createInsertSchema(spendTransactions).omit({ createdAt: true });
 
+// RFP Schemas
+export const insertRfpSchema = createInsertSchema(rfps).omit({ createdAt: true, updatedAt: true });
+export const insertProposalSchema = createInsertSchema(proposals).omit({ createdAt: true, updatedAt: true });
+export const insertProposalIssueSchema = createInsertSchema(proposalIssues).omit({ createdAt: true });
+export const insertVendorCommunicationSchema = createInsertSchema(vendorCommunications).omit({ createdAt: true, updatedAt: true });
+
 
 // Stripe Connect Integration Schemas
 
@@ -689,5 +774,15 @@ export type SpendCategory = typeof spendCategories.$inferSelect;
 export type InsertSpendCategory = z.infer<typeof insertSpendCategorySchema>;
 export type SpendTransaction = typeof spendTransactions.$inferSelect;
 export type InsertSpendTransaction = z.infer<typeof insertSpendTransactionSchema>;
+
+// RFP Types
+export type Rfp = typeof rfps.$inferSelect;
+export type InsertRfp = z.infer<typeof insertRfpSchema>;
+export type Proposal = typeof proposals.$inferSelect;
+export type InsertProposal = z.infer<typeof insertProposalSchema>;
+export type ProposalIssue = typeof proposalIssues.$inferSelect;
+export type InsertProposalIssue = z.infer<typeof insertProposalIssueSchema>;
+export type VendorCommunication = typeof vendorCommunications.$inferSelect;
+export type InsertVendorCommunication = z.infer<typeof insertVendorCommunicationSchema>;
 
 // Stripe Connect Integration Types

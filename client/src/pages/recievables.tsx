@@ -34,6 +34,7 @@ import {
   ShoppingCart
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
+import { CompanyLogo, extractDomain } from "@/components/company-logo";
 import {
   useArDashboardStats,
   useCustomers,
@@ -109,7 +110,7 @@ export default function AccountsReceivable() {
   // Invoice navigation function
   const viewInvoice = (invoiceId: string) => {
     // Navigate to the invoice view page
-    setLocation(`/ar/invoices/${invoiceId}`);
+    setLocation(`/recievables/invoices/${invoiceId}`);
   };
 
   // Provide fallback values while loading
@@ -268,9 +269,7 @@ export default function AccountsReceivable() {
                     {customers.map((customer: any) => (
                       <div key={customer.id} className="flex items-center justify-between p-4 border rounded-lg">
                         <div className="flex items-center space-x-4">
-                          <div className="h-10 w-10 bg-primary/10 rounded-full flex items-center justify-center">
-                            <Users className="h-5 w-5 text-primary" />
-                          </div>
+                          <CompanyLogo domain={getCustomerDomain(customer)} className="h-10 w-10" alt={`${customer.name} logo`} />
                           <div>
                             <h3 className="font-medium">{customer.name}</h3>
                             <p className="text-sm text-muted-foreground">
@@ -1107,7 +1106,7 @@ export default function AccountsReceivable() {
                   const dueDate = (document.getElementById('editInvoiceDueDate') as HTMLInputElement)?.value;
                   const description = (document.getElementById('editInvoiceDescription') as HTMLTextAreaElement)?.value;
 
-                  const response = await fetch(`/api/ar/invoices/${editingInvoice.id}`, {
+                  const response = await fetch(`/api/recievables/invoices/${editingInvoice.id}`, {
                     method: 'PATCH',
                     headers: {
                       'Content-Type': 'application/json',
@@ -1162,7 +1161,7 @@ export default function AccountsReceivable() {
             <AlertDialogAction 
               onClick={async () => {
                 try {
-                  const response = await fetch(`/api/ar/invoices/${invoiceToDelete?.id}`, {
+                  const response = await fetch(`/api/recievables/invoices/${invoiceToDelete?.id}`, {
                     method: 'DELETE',
                   });
                   
@@ -1211,7 +1210,7 @@ export default function AccountsReceivable() {
             <AlertDialogAction 
               onClick={async () => {
                 try {
-                  const response = await fetch(`/api/ar/customers/${customerToDelete?.id}`, {
+                  const response = await fetch(`/api/recievables/customers/${customerToDelete?.id}`, {
                     method: 'DELETE',
                   });
                   
@@ -1240,3 +1239,4 @@ export default function AccountsReceivable() {
     </div>
   );
 }
+  const getCustomerDomain = (customer?: any) => extractDomain(customer?.website || customer?.email || customer?.name);

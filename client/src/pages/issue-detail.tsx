@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { useParams, Link } from "wouter";
+import { useParams, Link, useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -50,12 +50,23 @@ import {
   ExternalLink,
   MessageSquare,
 } from "lucide-react";
-import type { Issue, CommentWithAuthor, User } from "@shared/schema";
+import type { Issue, User } from "@shared/schema";
 
 interface IssueDetailData extends Issue {
   assignees?: User[];
   createdBy?: User;
-  comments?: CommentWithAuthor[];
+}
+
+interface IssueFeedEntry {
+  id: string;
+  text: string;
+  createdAt: string;
+  actor: {
+    id: string;
+    name: string;
+    image?: string | null;
+  };
+  mentions?: string[];
 }
 
 // Utility function to render comment content with highlighted mentions
@@ -73,63 +84,41 @@ function renderCommentContent(content: string) {
   });
 }
 
-function CommentCard({ 
-  comment, 
+function FeedEntryCard({
+  entry,
   onDelete,
-  canDelete 
-}: { 
-  comment: CommentWithAuthor;
-  onDelete?: (commentId: string) => void;
+  canDelete,
+}: {
+  entry: IssueFeedEntry;
+  onDelete?: (activityId: string) => void;
   canDelete?: boolean;
 }) {
-  const isClientComment = comment.isClientComment;
   const [showDeleteAlert, setShowDeleteAlert] = useState(false);
 
   return (
     <>
-      <Card className={`${isClientComment ? "border-l-4 border-l-amber-500" : ""}`}>
+      <Card>
         <CardHeader className="pb-3">
           <div className="flex items-start gap-3">
             <Avatar className="h-10 w-10">
-              <AvatarImage
-                src={comment.author?.profileImageUrl || undefined}
-                className="object-cover"
-              />
-              <AvatarFallback className={`text-sm font-medium ${isClientComment ? "bg-amber-500/10 text-amber-600" : "bg-primary/10 text-primary"}`}>
-                {comment.author?.firstName?.[0] ||
-                  comment.authorName?.[0] ||
-                  "?"}
+              <AvatarImage src={entry.actor.image || undefined} className="object-cover" />
+              <AvatarFallback className="bg-primary/10 text-primary">
+                {entry.actor.name?.[0] || "?"}
               </AvatarFallback>
             </Avatar>
             <div className="flex-1">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-medium text-sm">
-                  {comment.author
-                    ? `${comment.author.firstName || ""} ${comment.author.lastName || ""}`.trim()
-                    : comment.authorName || "Unknown"}
-                </span>
-                {isClientComment && (
-                  <Badge className="text-xs bg-amber-500/10 text-amber-600 hover:bg-amber-500/20 border-amber-200">
-                    CLIENT
-                  </Badge>
-                )}
+                <span className="font-medium text-sm">{entry.actor.name || "Unknown"}</span>
                 <span className="text-xs text-muted-foreground ml-auto">
-                  {comment.createdAt &&
-                    new Date(comment.createdAt).toLocaleDateString("en-US", {
-                      month: "short",
-                      day: "numeric",
-                      year: "numeric",
-                      minute: "2-digit",
-                    })}
+                  {new Date(entry.createdAt).toLocaleDateString("en-US", {
+                    month: "short",
+                    day: "numeric",
+                    year: "numeric",
+                    hour: "numeric",
+                    minute: "2-digit",
+                  })}
                 </span>
               </div>
-              {comment.author && !isClientComment && (comment.author.role || comment.author.teamName) && (
-                <div className="text-xs text-muted-foreground">
-                  {comment.author.role && comment.author.teamName
-                    ? `${comment.author.role} • ${comment.author.teamName}`
-                    : comment.author.role || comment.author.teamName}
-                </div>
-              )}
             </div>
             {canDelete && onDelete && (
               <Button
@@ -146,43 +135,27 @@ function CommentCard({
         </CardHeader>
         <CardContent>
           <div className="space-y-2 text-sm">
-            {comment.content.split("\n").map((line, i) => (
-              <p key={i} className={`${i === 0 ? "mt-0" : ""} whitespace-pre-wrap`}>
+            {entry.text.split("\n").map((line, index) => (
+              <p key={index} className={`${index === 0 ? "mt-0" : ""} whitespace-pre-wrap`}>
                 {renderCommentContent(line)}
               </p>
             ))}
           </div>
-          {comment.attachments && comment.attachments.length > 0 && (
-            <div className="mt-4 flex flex-wrap gap-2">
-              {comment.attachments.map((attachment) => (
-                <a
-                  key={attachment.id}
-                  href={attachment.fileUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-2 px-3 py-2 rounded-md bg-muted text-sm hover-elevate"
-                >
-                  <Paperclip className="h-4 w-4" />
-                  {attachment.fileName}
-                </a>
-              ))}
-            </div>
-          )}
         </CardContent>
       </Card>
 
       <AlertDialog open={showDeleteAlert} onOpenChange={setShowDeleteAlert}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete Comment</AlertDialogTitle>
+            <AlertDialogTitle>Delete update</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete this comment? This action cannot be undone.
+              Deleting this feed entry is permanent.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
             onClick={() => {
-              if (onDelete) onDelete(comment.id);
+              if (onDelete) onDelete(entry.id);
               setShowDeleteAlert(false);
             }}
             className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
@@ -318,9 +291,15 @@ export default function IssueDetail() {
   const [newComment, setNewComment] = useState("");
   const [publishDialogOpen, setPublishDialogOpen] = useState(false);
   const [showMentions, setShowMentions] = useState(false);
+  const [, setLocation] = useLocation();
 
   const { data: issue, isLoading } = useQuery<IssueDetailData>({
     queryKey: [`/api/issues/${id}`],
+    enabled: !!id,
+  });
+
+  const { data: feedEntries, isLoading: feedLoading } = useQuery<IssueFeedEntry[]>({
+    queryKey: [`/api/issues/${id}/feed`],
     enabled: !!id,
   });
 
@@ -328,16 +307,16 @@ export default function IssueDetail() {
     queryKey: ["/api/team"],
   });
 
-  const addCommentMutation = useMutation({
+  const addFeedEntryMutation = useMutation({
     mutationFn: async (content: string) => {
-      return await apiRequest("POST", `/api/issues/${id}/comments`, { content });
+      return await apiRequest("POST", `/api/issues/${id}/feed`, { content });
     },
     onSuccess: () => {
       setNewComment("");
-      queryClient.invalidateQueries({ queryKey: [`/api/issues/${id}`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/issues/${id}/feed`] });
       toast({
-        title: "Comment added",
-        description: "Your comment has been posted successfully.",
+        title: "Update posted",
+        description: "Your note is live in the thread.",
       });
     },
     onError: (error: Error) => {
@@ -369,21 +348,47 @@ export default function IssueDetail() {
     },
   });
 
-  const deleteCommentMutation = useMutation({
-    mutationFn: async (commentId: string) => {
-      return await apiRequest("DELETE", `/api/issues/${id}/comments/${commentId}`);
+  const deleteEntryMutation = useMutation({
+    mutationFn: async (activityId: string) => {
+      return await apiRequest("DELETE", `/api/issues/${id}/feed/${activityId}`);
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: [`/api/issues/${id}`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/issues/${id}/feed`] });
       toast({
-        title: "Comment deleted",
-        description: "The comment has been removed.",
+        title: "Entry deleted",
+        description: "The feed entry has been removed.",
       });
     },
     onError: (error: Error) => {
       toast({
         title: "Error",
         description: error.message || "Failed to delete comment",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const [deleteAlertOpen, setDeleteAlertOpen] = useState(false);
+
+  const deleteIssueMutation = useMutation({
+    mutationFn: async () => {
+      if (!issue) {
+        throw new Error("Issue not loaded");
+      }
+      return await apiRequest("DELETE", `/api/issues/${issue.id}`);
+    },
+    onSuccess: () => {
+      toast({
+        title: "Issue deleted",
+        description: "This issue has been removed.",
+      });
+      queryClient.invalidateQueries({ queryKey: ["/api/issues"] });
+      setLocation("/issues");
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Unable to delete issue",
+        description: error?.message || "Failed to delete this issue",
         variant: "destructive",
       });
     },
@@ -557,6 +562,14 @@ export default function IssueDetail() {
                   <Trash2 className="mr-2 h-4 w-4" />
                   Mark as Lost
                 </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => setDeleteAlertOpen(true)}
+                  className="text-destructive"
+                >
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  Delete Issue
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -606,14 +619,28 @@ export default function IssueDetail() {
             </Card>
           )}
 
-          {issue.comments?.map((comment) => (
-            <CommentCard 
-              key={comment.id} 
-              comment={comment}
-              canDelete={!comment.isClientComment}
-              onDelete={(commentId) => deleteCommentMutation.mutate(commentId)}
-            />
-          ))}
+          {feedLoading ? (
+            <div className="space-y-4">
+              {[...Array(2)].map((_, index) => (
+                <Skeleton key={index} className="h-32 w-full" />
+              ))}
+            </div>
+          ) : feedEntries && feedEntries.length > 0 ? (
+            feedEntries.map((entry) => (
+              <FeedEntryCard
+                key={entry.id}
+                entry={entry}
+                canDelete={user?.isAdmin}
+                onDelete={(activityId) => deleteEntryMutation.mutate(activityId)}
+              />
+            ))
+          ) : (
+            <Card>
+              <CardContent className="py-10 text-center text-sm text-muted-foreground">
+                No activity yet. Be the first to drop an update.
+              </CardContent>
+            </Card>
+          )}
 
           <Card>
             <CardHeader className="pb-3">
@@ -702,12 +729,12 @@ export default function IssueDetail() {
                   </Button>
                 </div>
                 <Button
-                  onClick={() => addCommentMutation.mutate(newComment)}
-                  disabled={!newComment.trim() || addCommentMutation.isPending}
+                  onClick={() => addFeedEntryMutation.mutate(newComment)}
+                  disabled={!newComment.trim() || addFeedEntryMutation.isPending}
                   data-testid="button-submit-comment"
                 >
                   <Send className="mr-2 h-4 w-4" />
-                  Comment
+                  {addFeedEntryMutation.isPending ? "Posting..." : "Post update"}
                 </Button>
               </div>
             </CardContent>
@@ -793,13 +820,15 @@ export default function IssueDetail() {
               )}
 
               <div className="space-y-2">
-                {issue.isPublished && issue.publishedSlug && (
+                {issue.isPublished && (
                   <div>
                     <h4 className="text-sm font-medium text-muted-foreground mb-2">
                       Public Chat Link
                     </h4>
                     <a
-                      href={`/chat/${issue.publishedSlug}`}
+                      href={`/chat/customer?issue=${issue.id}${
+                        issue.contactEmail ? `&email=${encodeURIComponent(issue.contactEmail)}` : ""
+                      }`}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="text-sm text-primary hover:underline flex items-center gap-1"
@@ -826,6 +855,27 @@ export default function IssueDetail() {
           </Card>
         </div>
       </div>
+      <AlertDialog open={deleteAlertOpen} onOpenChange={setDeleteAlertOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Issue</AlertDialogTitle>
+            <AlertDialogDescription>
+              Deleting this issue is permanent. All associated comments and activity will be removed.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            onClick={() => {
+              deleteIssueMutation.mutate();
+              setDeleteAlertOpen(false);
+            }}
+            disabled={deleteIssueMutation.isPending}
+          >
+            {deleteIssueMutation.isPending ? "Deleting..." : "Delete Issue"}
+          </AlertDialogAction>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

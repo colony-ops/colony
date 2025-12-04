@@ -11,10 +11,11 @@ import {
   Plus,
   DollarSign,
   Receipt,
-  ShoppingCart,
   Building2,
   CreditCard,
-  Package,
+  InboxIcon,
+  SendIcon,
+  FileOutputIcon,
 } from "lucide-react";
 import {
   Sidebar,
@@ -37,9 +38,8 @@ import type { User, Workspace } from "@shared/schema";
 const mainNavItems = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard },
   { title: "Issues", url: "/issues", icon: CircleDot },
-  { title: "Accounts Payable", url: "/ap", icon: Receipt },
-  { title: "Accounts Receivable", url: "/ar", icon: DollarSign },
-  { title: "Procurement", url: "/procurement", icon: ShoppingCart },
+  { title: "Payables", url: "/payables", icon: FileOutputIcon },
+  { title: "Receivables", url: "/recievables", icon: DollarSign },
   { title: "Team", url: "/team", icon: Users },
 ];
 
@@ -128,7 +128,7 @@ export function AppSidebar() {
               </SidebarMenuItem>
               <SidebarMenuItem>
                 <SidebarMenuButton asChild tooltip="New Vendor">
-                  <Link href="/ap/vendors/new" data-testid="nav-new-vendor">
+                  <Link href="/vendors#new" data-testid="nav-new-vendor">
                     <Building2 className="h-4 w-4" />
                     <span>New Vendor</span>
                   </Link>
@@ -136,17 +136,9 @@ export function AppSidebar() {
               </SidebarMenuItem>
               <SidebarMenuItem>
                 <SidebarMenuButton asChild tooltip="New Invoice">
-                  <Link href="/ar/invoices/new" data-testid="nav-new-invoice">
+                  <Link href="/recievables/invoices/new" data-testid="nav-new-invoice">
                     <CreditCard className="h-4 w-4" />
                     <span>New Invoice</span>
-                  </Link>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-              <SidebarMenuItem>
-                <SidebarMenuButton asChild tooltip="New Purchase Order">
-                  <Link href="/procurement/purchase-orders/new" data-testid="nav-new-po">
-                    <Package className="h-4 w-4" />
-                    <span>New PO</span>
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

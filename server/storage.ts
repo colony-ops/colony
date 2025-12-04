@@ -32,6 +32,11 @@ import {
   supplierRatings,
   spendCategories,
   spendTransactions,
+  // RFP entities
+  rfps,
+  proposals,
+  proposalIssues,
+  vendorCommunications,
   type User,
   type UpsertUser,
   type Workspace,
@@ -88,9 +93,18 @@ import {
   type SupplierRating,
   type SpendCategory,
   type SpendTransaction,
+  // RFP types
+  type Rfp,
+  type InsertRfp,
+  type Proposal,
+  type InsertProposal,
+  type ProposalIssue,
+  type InsertProposalIssue,
+  type VendorCommunication,
+  type InsertVendorCommunication,
 } from "../shared/schema";
 import { db } from "./db";
-import { eq, desc, and, sql, count as countFn } from "drizzle-orm";
+import { eq, desc, and, sql, count as countFn, inArray } from "drizzle-orm";
 
 export interface IStorage {
   // User operations
@@ -150,6 +164,7 @@ export interface IStorage {
   // Vendor operations
   getVendorsByWorkspace(workspaceId: string): Promise<Vendor[]>;
   getVendor(id: string): Promise<Vendor | undefined>;
+  getVendorByEmail(email: string): Promise<Vendor | undefined>;
   createVendor(vendor: InsertVendor): Promise<Vendor>;
   updateVendor(id: string, data: Partial<Vendor>): Promise<Vendor | undefined>;
   deleteVendor(id: string): Promise<void>;
@@ -242,6 +257,30 @@ export interface IStorage {
   // Spend Transaction operations
   getSpendTransactionsByWorkspace(workspaceId: string): Promise<SpendTransaction[]>;
   createSpendTransaction(transaction: any): Promise<SpendTransaction>;
+
+  // ==================== RFP (REQUEST FOR PROPOSALS) ====================
+  getRfpsByWorkspace(workspaceId: string): Promise<Rfp[]>;
+  getRfp(id: string): Promise<Rfp | undefined>;
+  createRfp(rfp: InsertRfp): Promise<Rfp>;
+  updateRfp(id: string, data: Partial<Rfp>): Promise<Rfp | undefined>;
+  deleteRfp(id: string): Promise<void>;
+
+  // Proposal operations
+  getProposalsByRfp(rfpId: string): Promise<Proposal[]>;
+  createProposal(proposal: InsertProposal): Promise<Proposal>;
+  getProposalsByRfpAndEmail(rfpId: string, email: string): Promise<Proposal[]>;
+  getProposalsByWorkspace(workspaceId: string): Promise<Proposal[]>;
+  getProposalWithRfp(proposalId: string): Promise<(Proposal & { rfp: Rfp }) | undefined>;
+
+  // Proposal Issue operations
+  createProposalIssue(proposalIssue: InsertProposalIssue): Promise<ProposalIssue>;
+  getProposalIssuesByProposals(proposalIds: string[]): Promise<ProposalIssue[]>;
+
+  // Vendor communications
+  createVendorCommunication(entry: InsertVendorCommunication): Promise<VendorCommunication>;
+  getVendorCommunications(filters: { workspaceId?: string; vendorId?: string; rfpId?: string; proposalIds?: string[]; email?: string }): Promise<VendorCommunication[]>;
+  getVendorCommunication(id: string): Promise<VendorCommunication | undefined>;
+  deleteVendorCommunication(id: string): Promise<void>;
 
   // ==================== MERCURY INTEGRATION ====================
   // TODO: Implement when Mercury integration is ready
@@ -594,6 +633,11 @@ export class DatabaseStorage implements IStorage {
 
   async getVendor(id: string): Promise<Vendor | undefined> {
     const [vendor] = await db.select().from(vendors).where(eq(vendors.id, id));
+    return vendor;
+  }
+
+  async getVendorByEmail(email: string): Promise<Vendor | undefined> {
+    const [vendor] = await db.select().from(vendors).where(eq(vendors.email, email));
     return vendor;
   }
 
@@ -1141,6 +1185,131 @@ export class DatabaseStorage implements IStorage {
     return created;
   }
 
+  // ==================== RFP (REQUEST FOR PROPOSALS) ====================
+  async getRfpsByWorkspace(workspaceId: string): Promise<Rfp[]> {
+    return await db
+      .select()
+      .from(rfps)
+      .where(eq(rfps.workspaceId, workspaceId))
+      .orderBy(desc(rfps.createdAt));
+  }
+
+  async getRfp(id: string): Promise<Rfp | undefined> {
+    const [rfp] = await db.select().from(rfps).where(eq(rfps.id, id));
+    return rfp;
+  }
+
+  async createRfp(rfp: InsertRfp): Promise<Rfp> {
+    const [created] = await db.insert(rfps).values(rfp).returning();
+    return created;
+  }
+
+  async updateRfp(id: string, data: Partial<Rfp>): Promise<Rfp | undefined> {
+    const [rfp] = await db
+      .update(rfps)
+      .set({ ...data, updatedAt: new Date() })
+      .where(eq(rfps.id, id))
+      .returning();
+    return rfp;
+  }
+
+  async deleteRfp(id: string): Promise<void> {
+    await db.delete(rfps).where(eq(rfps.id, id));
+  }
+
+  // Proposal operations
+  async getProposalsByRfp(rfpId: string): Promise<Proposal[]> {
+    return await db
+      .select()
+      .from(proposals)
+      .where(eq(proposals.rfpId, rfpId))
+      .orderBy(desc(proposals.submittedAt));
+  }
+
+  async createProposal(proposal: InsertProposal): Promise<Proposal> {
+    const [created] = await db.insert(proposals).values(proposal).returning();
+    return created;
+  }
+
+  async getProposalsByRfpAndEmail(rfpId: string, email: string): Promise<Proposal[]> {
+    return await db
+      .select()
+      .from(proposals)
+      .where(and(eq(proposals.rfpId, rfpId), eq(proposals.email, email)))
+      .orderBy(desc(proposals.submittedAt));
+  }
+
+  async getProposalsByWorkspace(workspaceId: string): Promise<Proposal[]> {
+    return await db
+      .select({ ...proposals, rfpWorkspaceId: rfps.workspaceId })
+      .from(proposals)
+      .innerJoin(rfps, eq(rfps.id, proposals.rfpId))
+      .where(eq(rfps.workspaceId, workspaceId))
+      .orderBy(desc(proposals.submittedAt));
+  }
+
+  async getProposalWithRfp(proposalId: string): Promise<(Proposal & { rfp: Rfp }) | undefined> {
+    const rows = await db
+      .select({
+        proposal: proposals,
+        rfp: rfps,
+      })
+      .from(proposals)
+      .innerJoin(rfps, eq(rfps.id, proposals.rfpId))
+      .where(eq(proposals.id, proposalId));
+
+    if (!rows.length) return undefined;
+    return { ...rows[0].proposal, rfp: rows[0].rfp } as Proposal & { rfp: Rfp };
+  }
+
+  // Proposal Issue operations
+  async createProposalIssue(proposalIssue: InsertProposalIssue): Promise<ProposalIssue> {
+    const [created] = await db.insert(proposalIssues).values(proposalIssue).returning();
+    return created;
+  }
+
+  async getProposalIssuesByProposals(proposalIds: string[]): Promise<ProposalIssue[]> {
+    if (proposalIds.length === 0) return [];
+
+    return await db
+      .select()
+      .from(proposalIssues)
+      .where(inArray(proposalIssues.proposalId, proposalIds))
+      .orderBy(proposalIssues.createdAt);
+  }
+
+  // Vendor communications
+  async createVendorCommunication(entry: InsertVendorCommunication): Promise<VendorCommunication> {
+    const [created] = await db.insert(vendorCommunications).values(entry).returning();
+    return created;
+  }
+
+  async getVendorCommunications(filters: { workspaceId?: string; vendorId?: string; rfpId?: string; proposalIds?: string[]; email?: string }): Promise<VendorCommunication[]> {
+    let query = db.select().from(vendorCommunications);
+    const conditions = [];
+
+    if (filters.workspaceId) conditions.push(eq(vendorCommunications.workspaceId, filters.workspaceId));
+    if (filters.vendorId) conditions.push(eq(vendorCommunications.vendorId, filters.vendorId));
+    if (filters.rfpId) conditions.push(eq(vendorCommunications.rfpId, filters.rfpId));
+    if (filters.email) conditions.push(eq(vendorCommunications.authorEmail, filters.email));
+    if (filters.proposalIds?.length) conditions.push(inArray(vendorCommunications.proposalId, filters.proposalIds));
+
+    if (conditions.length) {
+      query = query.where(and(...conditions));
+    }
+
+    return await query.orderBy(desc(vendorCommunications.createdAt));
+  }
+
+  async getVendorCommunication(id: string): Promise<VendorCommunication | undefined> {
+    const [record] = await db.select().from(vendorCommunications).where(eq(vendorCommunications.id, id));
+    return record;
+  }
+
+  async deleteVendorCommunication(id: string): Promise<void> {
+    await db.delete(vendorCommunications).where(eq(vendorCommunications.id, id));
+  }
+
   // ==================== MERCURY INTEGRATION ====================
   
   // Mercury Sync operations - TODO: Implement when Mercury integration is ready
@@ -1165,4 +1334,3 @@ export class DatabaseStorage implements IStorage {
 }
 
 export const storage = new DatabaseStorage();
-

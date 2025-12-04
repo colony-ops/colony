@@ -88,7 +88,7 @@ export function InvoiceView() {
   const fetchInvoice = async () => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/ar/invoices/${id}`);
+      const response = await fetch(`/api/recievables/invoices/${id}`);
       
       if (!response.ok) {
         throw new Error('Failed to fetch invoice');
